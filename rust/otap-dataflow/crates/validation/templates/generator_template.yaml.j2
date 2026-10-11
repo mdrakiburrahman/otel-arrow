@@ -68,6 +68,14 @@
         - "control_port{{ loop.index }}"
 {% endfor %}
       config:
+    # Receivers start concurrently; retry branches without replaying their siblings.
+    suv_retry:
+      type: "urn:otel:processor:retry"
+      config:
+        initial_interval: 100ms
+        max_interval: 1s
+        max_elapsed_time: 10s
+        exhaustion_action: mark_permanent
 {% if custom_suv_exporter %}
     suv_exporter:
 {{ custom_suv_exporter | indent(6, true) }}
@@ -97,6 +105,13 @@
 {% endif %}
 {% endif %}
 {% for control_port in control_ports %}
+    control_retry{{ loop.index }}:
+      type: "urn:otel:processor:retry"
+      config:
+        initial_interval: 100ms
+        max_interval: 1s
+        max_elapsed_time: 10s
+        exhaustion_action: mark_permanent
     control_exporter{{ loop.index }}:
       type: "urn:otel:exporter:otlp_grpc"
       config:
@@ -106,8 +121,12 @@
   - from: {{ generator_label }}
     to: fanout
   - from: fanout["suv_port"]
+    to: suv_retry
+  - from: suv_retry
     to: suv_exporter
 {% for _ in control_ports %}
   - from: fanout["control_port{{ loop.index }}"]
+    to: control_retry{{ loop.index }}
+  - from: control_retry{{ loop.index }}
     to: control_exporter{{ loop.index }}
 {% endfor %}

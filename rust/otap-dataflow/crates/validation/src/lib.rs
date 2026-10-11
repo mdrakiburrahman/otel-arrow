@@ -620,9 +620,11 @@ mod tests {
             .expect("transform kql passthrough traces validation failed");
     }
 
-    /// Tests the transform processor OPL `exclude` operation. Removes the
+    /// Tests the transform processor OPL `remove` operation. Removes the
     /// `thread.id` attribute from every log record while preserving `thread.name`.
-    /// Query: `logs | exclude attributes["thread.id"]`
+    /// Query: `logs | remove attributes["thread.id"]`
+    /// Scenario: OPL removes the synthetic thread ID while retaining the thread name.
+    /// Guarantees: every captured log lacks thread.id and still contains thread.name.
     #[test]
     fn validation_transform_opl_exclude_attribute() {
         Scenario::new()
@@ -741,11 +743,13 @@ mod tests {
             .expect("transform opl conditional-set validation failed");
     }
 
-    /// Tests the transform processor with chained OPL `set` + `exclude`
+    /// Tests the transform processor with chained OPL `set` + `remove`
     /// operations. First adds a `processed` attribute, then removes
     /// `thread.id`. Both transformations must be reflected in the output.
-    /// Query: `logs | set attributes["processed"] = "yes" | exclude
+    /// Query: `logs | set attributes["processed"] = "yes" | remove
     ///   attributes["thread.id"]`
+    /// Scenario: OPL adds a marker and removes a synthetic attribute in one pipeline.
+    /// Guarantees: captured logs have processed and lack thread.id.
     #[test]
     fn validation_transform_opl_chained_set_exclude() {
         Scenario::new()
