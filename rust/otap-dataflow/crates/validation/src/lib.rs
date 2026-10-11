@@ -100,15 +100,17 @@ mod tests {
             .expect("validation scenario failed");
     }
 
+    /// Scenario: synthetic logs are filtered on their thread name, then that key is renamed.
+    /// Guarantees: a nonempty captured stream has the renamed key and no original key.
     #[test]
     fn validation_attribute_processor_pipeline() {
         let deny = ValidationInstructions::AttributeDeny {
             domains: vec![AttributeDomain::Signal],
-            keys: vec!["ios.app.state".into()],
+            keys: vec!["thread.name".into()],
         };
         let require = ValidationInstructions::AttributeRequireKey {
             domains: vec![AttributeDomain::Signal],
-            keys: vec!["ios.app.state2".into()],
+            keys: vec!["thread.name.renamed".into()],
         };
         Scenario::new()
             .pipeline(
@@ -134,13 +136,15 @@ mod tests {
             .expect("attribute processor validation failed");
     }
 
+    /// Scenario: synthetic logs contain several thread names and a strict filter selects main.
+    /// Guarantees: captured logs retain the selected attribute and are compared with control traffic.
     #[test]
     fn validation_filter_processor_pipeline() {
         let attr_check = ValidationInstructions::AttributeRequireKeyValue {
             domains: vec![AttributeDomain::Signal],
             pairs: vec![KeyValue::new(
-                "ios.app.state".into(),
-                AnyValue::String("active".into()),
+                "thread.name".into(),
+                AnyValue::String("main".into()),
             )],
         };
 
