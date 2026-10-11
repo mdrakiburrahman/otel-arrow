@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, UInt32Array};
+use arrow::array::{Array, ArrayRef, RecordBatch, StructArray, UInt32Array};
 use arrow::compute::kernels::cast;
 use arrow::compute::kernels::numeric::add;
 use arrow::compute::max;
-use arrow::datatypes::{DataType, Field, Schema, UInt16Type, UInt32Type};
+use arrow::datatypes::{DataType, Field, Schema, UInt32Type};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use otel_arrow_dfe_pdata::schema::{consts, update_schema_metadata};
 use uuid::Uuid;
@@ -67,28 +67,19 @@ impl PartitionSequenceIdGenerator {
         // curr_max and also check for overflows before incrementing all the IDs
         let mut max_id = 0;
         for payload_type in payload_types {
-            if let Some(id_column) = otap_batch
-                .get(*payload_type)
-                .and_then(|rb| rb.column_by_name(consts::ID))
-            {
-                let record_batch_max_id = match id_column.data_type() {
-                    DataType::UInt16 => max::<UInt16Type>(
-                        id_column
-                            .as_any()
-                            .downcast_ref()
-                            .expect("can downcast to UInt16Array"),
-                    )
-                    .map(|max| max as u32),
-                    DataType::UInt32 => max::<UInt32Type>(
-                        id_column
-                            .as_any()
-                            .downcast_ref()
-                            .expect("can downcast to UInt32Array"),
-                    ),
-                    _ => None,
-                };
-                if let Some(record_batch_max_id) = record_batch_max_id {
-                    max_id = max_id.max(record_batch_max_id)
+            if let Some(batch) = otap_batch.get(*payload_type) {
+                for name in [consts::ID, consts::PARENT_ID] {
+                    if let Some(column) = batch.column_by_name(name) {
+                        max_id = max_id.max(Self::max_id(column)?);
+                    }
+                }
+                for name in [consts::RESOURCE, consts::SCOPE] {
+                    if let Some(column) = batch.column_by_name(name)
+                        && let Some(value) = column.as_any().downcast_ref::<StructArray>()
+                        && let Some(id) = value.column_by_name(consts::ID)
+                    {
+                        max_id = max_id.max(Self::max_id(id)?);
+                    }
                 }
             }
         }
@@ -105,6 +96,8 @@ impl PartitionSequenceIdGenerator {
             if let Some(rb) = otap_batch.get(*payload_type) {
                 let rb = self.add_offset_to_column(consts::ID, rb)?;
                 let rb = self.add_offset_to_column(consts::PARENT_ID, &rb)?;
+                let rb = self.add_offset_to_nested_id(consts::RESOURCE, &rb)?;
+                let rb = self.add_offset_to_nested_id(consts::SCOPE, &rb)?;
                 otap_batch.set(*payload_type, rb);
             }
 
@@ -156,25 +149,7 @@ impl PartitionSequenceIdGenerator {
                 return Ok(record_batch.clone());
             }
         };
-        let id_column = record_batch.column(id_column_index);
-
-        // cast ID column to type of self.curr_offset and add offset
-        let id_column = match cast(id_column, &DataType::UInt32) {
-            Ok(id_col) => id_col,
-            Err(err) => {
-                return Err(ParquetExporterError::InvalidRecordBatch {
-                    error: format!("could not cast ID column to UInt32: {err}"),
-                });
-            }
-        };
-        let new_id_col = match add(&UInt32Array::new_scalar(self.curr_max), &id_column) {
-            Ok(col) => col,
-            Err(e) => {
-                return Err(ParquetExporterError::UnknownError {
-                    error: format!("{e}"),
-                });
-            }
-        };
+        let new_id_col = self.offset_values(record_batch.column(id_column_index))?;
 
         // construct new record batch
         let new_columns = record_batch
@@ -210,6 +185,77 @@ impl PartitionSequenceIdGenerator {
                 .expect("can construct record batch"),
         )
     }
+
+    fn max_id(column: &ArrayRef) -> Result<u32, ParquetExporterError> {
+        let column = cast(column, &DataType::UInt32).map_err(|error| {
+            ParquetExporterError::InvalidRecordBatch {
+                error: format!("could not cast ID column to UInt32: {error}"),
+            }
+        })?;
+        let values = column
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("cast produces UInt32Array");
+        Ok(max::<UInt32Type>(values).unwrap_or(0))
+    }
+
+    fn offset_values(&self, column: &ArrayRef) -> Result<ArrayRef, ParquetExporterError> {
+        let column = cast(column, &DataType::UInt32).map_err(|error| {
+            ParquetExporterError::InvalidRecordBatch {
+                error: format!("could not cast ID column to UInt32: {error}"),
+            }
+        })?;
+        add(&UInt32Array::new_scalar(self.curr_max), &column).map_err(|error| {
+            ParquetExporterError::UnknownError {
+                error: error.to_string(),
+            }
+        })
+    }
+
+    fn add_offset_to_nested_id(
+        &self,
+        name: &str,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch, ParquetExporterError> {
+        let Ok(index) = batch.schema_ref().index_of(name) else {
+            return Ok(batch.clone());
+        };
+        let value = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| ParquetExporterError::InvalidRecordBatch {
+                error: format!("{name} must be a struct"),
+            })?;
+        let Some((id_index, _)) = value.fields().find(consts::ID) else {
+            return Ok(batch.clone());
+        };
+        let mut columns = value.columns().to_vec();
+        columns[id_index] = self.offset_values(&columns[id_index])?;
+        let mut fields = value.fields().to_vec();
+        fields[id_index] = Arc::new(Field::new(consts::ID, DataType::UInt32, true));
+        let value = StructArray::try_new(fields.into(), columns, value.nulls().cloned()).map_err(
+            |error| ParquetExporterError::InvalidRecordBatch {
+                error: error.to_string(),
+            },
+        )?;
+        let mut columns = batch.columns().to_vec();
+        let mut fields = batch.schema_ref().fields().to_vec();
+        fields[index] = Arc::new(
+            fields[index]
+                .as_ref()
+                .clone()
+                .with_data_type(value.data_type().clone()),
+        );
+        columns[index] = Arc::new(value);
+        RecordBatch::try_new(
+            Arc::new(Schema::new(fields).with_metadata(batch.schema_ref().metadata().clone())),
+            columns,
+        )
+        .map_err(|error| ParquetExporterError::InvalidRecordBatch {
+            error: error.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +276,86 @@ pub mod test {
     };
 
     use super::*;
+
+    /// Scenario: repeated batches reuse resource and scope IDs while attributes reference those IDs.
+    /// Guarantees: nested references advance with child parent IDs, include their maxima, and preserve struct null masks.
+    #[test]
+    fn resource_and_scope_references_follow_attribute_ids() {
+        use arrow::buffer::NullBuffer;
+        use otel_arrow_dfe_pdata::otap::raw_batch_store::RawLogsStore;
+        let make = || {
+            let nested = |id| -> ArrayRef {
+                Arc::new(
+                    StructArray::try_new(
+                        vec![Field::new(consts::ID, DataType::UInt16, true)].into(),
+                        vec![Arc::new(UInt16Array::from(vec![Some(id), None]))],
+                        Some(NullBuffer::from(vec![true, false])),
+                    )
+                    .unwrap(),
+                )
+            };
+            let root = RecordBatch::try_from_iter(vec![
+                (
+                    consts::ID,
+                    Arc::new(UInt16Array::from(vec![0, 1])) as ArrayRef,
+                ),
+                (consts::RESOURCE, nested(7)),
+                (consts::SCOPE, nested(9)),
+            ])
+            .unwrap();
+            let mut store = RawLogsStore::new();
+            store.set(ArrowPayloadType::Logs, root);
+            for (payload, id) in [
+                (ArrowPayloadType::ResourceAttrs, 7),
+                (ArrowPayloadType::ScopeAttrs, 9),
+            ] {
+                store.set(
+                    payload,
+                    RecordBatch::try_from_iter(vec![(
+                        consts::PARENT_ID,
+                        Arc::new(UInt16Array::from(vec![id])) as ArrayRef,
+                    )])
+                    .unwrap(),
+                );
+            }
+            OtapParquetRecords::Logs(store)
+        };
+        let mut generator = PartitionSequenceIdGenerator::new();
+        for offset in [0, 10] {
+            let mut records = make();
+            generator.generate_unique_ids(&mut records).unwrap();
+            let root = records.get(ArrowPayloadType::Logs).unwrap();
+            for (name, payload, original) in [
+                (consts::RESOURCE, ArrowPayloadType::ResourceAttrs, 7),
+                (consts::SCOPE, ArrowPayloadType::ScopeAttrs, 9),
+            ] {
+                let nested = root
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                assert!(nested.is_null(1));
+                let ids = nested
+                    .column_by_name(consts::ID)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap();
+                let children = records
+                    .get(payload)
+                    .unwrap()
+                    .column_by_name(consts::PARENT_ID)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap();
+                assert_eq!(ids.value(0), original + offset);
+                assert_eq!(ids.value(0), children.value(0));
+                assert!(ids.is_null(1));
+            }
+        }
+    }
 
     #[test]
     fn test_partition_sequence_id_generator_logs() {

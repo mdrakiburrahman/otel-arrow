@@ -74,6 +74,7 @@ const PARQUET_EXPORTER_URN: &str = "urn:otel:exporter:parquet";
 /// Parquet exporter for OTAP Data
 pub struct ParquetExporter {
     config: config::Config,
+    backend: Option<Arc<dyn writer::FileSinkFactory>>,
     token_provider: Option<
         Box<dyn otel_arrow_dfe_engine::shared::capability::auth::bearer_token_provider::BearerTokenProvider>,
     >,
@@ -125,6 +126,7 @@ impl ParquetExporter {
         // Prefer using from_config in the factory path so metrics are properly wired.
         Self {
             config,
+            backend: None,
             token_provider: None,
             pdata_metrics: None,
             io_metrics: None,
@@ -147,10 +149,19 @@ impl ParquetExporter {
 
         Ok(ParquetExporter {
             config,
+            backend: None,
             token_provider: None,
             pdata_metrics: Some(pdata_metrics),
             io_metrics: Some(io_metrics),
         })
+    }
+
+    /// Inject an external file backend without duplicating OTAP processing.
+    pub fn with_backend(mut self, backend: Arc<dyn writer::FileSinkFactory>) -> Self {
+        self.backend = Some(backend);
+        // External backends own their I/O metrics; do not label their commits as Parquet.
+        self.io_metrics = None;
+        self
     }
 
     fn terminal_state(
@@ -229,11 +240,44 @@ impl Exporter<OtapPdata> for ParquetExporter {
         }
 
         let mut writer = writer::WriterManager::new(object_store, writer_options);
+        if let Some(backend) = &self.backend {
+            writer = writer.with_backend(Arc::clone(backend));
+        }
         let mut batch_id = 0;
         let mut id_generator = PartitionSequenceIdGenerator::new();
 
         loop {
-            match msg_chan.recv().await? {
+            let accepting_pdata = !writer.is_backpressured();
+            let message = {
+                let progress = writer.progress().fuse();
+                let receive = msg_chan.recv_when(accepting_pdata).fuse();
+                pin_mut!(progress, receive);
+                futures::select_biased! {
+                    completed = progress => {
+                        match completed {
+                            Ok(stats) => {
+                                if let Some(io) = self.io_metrics.as_mut() {
+                                    record_io_metrics(io, stats);
+                                }
+                            }
+                            Err(error) => {
+                                if let Some(io) = self.io_metrics.as_mut() {
+                                    record_io_metrics(io, error.stats);
+                                }
+                                return Err(Error::ExporterError {
+                                    exporter: exporter_id.clone(),
+                                    kind: ExporterErrorKind::Transport,
+                                    source_detail: format_error_sources(&error),
+                                    error: format!("File publication failed: {error}"),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    message = receive => message?,
+                }
+            };
+            match message {
                 Message::Control(NodeControlMsg::TimerTick { .. }) => {
                     match writer.flush_aged_beyond_threshold().await {
                         Ok(stats) => {
@@ -412,6 +456,17 @@ impl Exporter<OtapPdata> for ParquetExporter {
                             source_detail,
                         }
                     })?;
+
+                    if let Some(backend) = &self.backend {
+                        backend
+                            .prepare(&mut otap_batch)
+                            .map_err(|error| Error::ExporterError {
+                                exporter: exporter_id.clone(),
+                                kind: ExporterErrorKind::Other,
+                                source_detail: format_error_sources(&error),
+                                error: format!("External file backend preparation failed: {error}"),
+                            })?;
+                    }
 
                     // compute any partitions
                     let partitions = match self.config.partitioning_strategies.as_ref() {

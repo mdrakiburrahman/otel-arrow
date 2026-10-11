@@ -351,7 +351,7 @@ fn get_template_schema(
 
 static RESOURCE_TEMPLATE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![
-        Field::new(consts::ID, DataType::UInt16, true),
+        Field::new(consts::ID, DataType::UInt32, true),
         Field::new(consts::SCHEMA_URL, DataType::Utf8, true),
         Field::new(consts::DROPPED_ATTRIBUTES_COUNT, DataType::UInt32, true),
     ])
@@ -359,7 +359,7 @@ static RESOURCE_TEMPLATE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
 
 static SCOPE_TEMPLATE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![
-        Field::new(consts::ID, DataType::UInt16, true),
+        Field::new(consts::ID, DataType::UInt32, true),
         Field::new(consts::NAME, DataType::Utf8, true),
         Field::new(consts::VERSION, DataType::Utf8, true),
         Field::new(consts::DROPPED_ATTRIBUTES_COUNT, DataType::UInt32, true),
@@ -368,7 +368,7 @@ static SCOPE_TEMPLATE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
 
 static LOGS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
-        Field::new(consts::ID, DataType::UInt16, true),
+        Field::new(consts::ID, DataType::UInt32, true),
         Field::new(
             consts::RESOURCE,
             DataType::Struct(RESOURCE_TEMPLATE_FIELDS.clone()),
@@ -419,7 +419,7 @@ static LOGS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 
 static METRICS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
-        Field::new(consts::ID, DataType::UInt16, true),
+        Field::new(consts::ID, DataType::UInt32, true),
         Field::new(
             consts::RESOURCE,
             DataType::Struct(RESOURCE_TEMPLATE_FIELDS.clone()),
@@ -443,7 +443,7 @@ static METRICS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static NUMBERS_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, false),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(
             consts::START_TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
@@ -463,7 +463,7 @@ static NUMBERS_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static SUMMARY_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, false),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(
             consts::START_TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
@@ -495,7 +495,7 @@ static SUMMARY_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static HISTOGRAM_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, false),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(
             consts::START_TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
@@ -527,7 +527,7 @@ static HISTOGRAM_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static EXP_HISTOGRAM_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, false),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(
             consts::START_TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
@@ -590,7 +590,7 @@ static EXEMPLAR_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 
 static SPANS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
-        Field::new(consts::ID, DataType::UInt16, true),
+        Field::new(consts::ID, DataType::UInt32, true),
         Field::new(
             consts::RESOURCE,
             DataType::Struct(RESOURCE_TEMPLATE_FIELDS.clone()),
@@ -635,7 +635,7 @@ static SPANS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static SPAN_EVENTS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, true),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(
             consts::TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
@@ -649,7 +649,7 @@ static SPAN_EVENTS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static SPAN_LINKS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, true),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(consts::TRACE_ID, DataType::FixedSizeBinary(16), true),
         Field::new(consts::SPAN_ID, DataType::FixedSizeBinary(8), true),
         Field::new(consts::TRACE_STATE, DataType::Utf8, true),
@@ -659,7 +659,7 @@ static SPAN_LINKS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 
 static ATTRS_16_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(consts::ATTRIBUTE_KEY, DataType::Utf8, false),
         Field::new(consts::ATTRIBUTE_TYPE, DataType::UInt8, false),
         Field::new(consts::ATTRIBUTE_STR, DataType::Utf8, true),
@@ -896,6 +896,8 @@ mod test {
         ));
     }
 
+    /// Scenario: an input batch omits resource/body fields and includes a partial scope struct.
+    /// Guarantees: missing IDs use the widened file schema while existing values and nullability are retained.
     #[test]
     fn test_coalesces_new_columns_with_empty_columns() {
         let log_attrs_record_batch = RecordBatch::try_new(
@@ -935,7 +937,7 @@ mod test {
                 .unwrap();
 
         let expected_resource_fields = Fields::from(vec![
-            Field::new(consts::ID, DataType::UInt16, true),
+            Field::new(consts::ID, DataType::UInt32, true),
             Field::new(consts::SCHEMA_URL, DataType::Utf8, true),
             Field::new(consts::DROPPED_ATTRIBUTES_COUNT, DataType::UInt32, true),
         ]);
@@ -1000,7 +1002,7 @@ mod test {
                 Arc::new(StructArray::new(
                     expected_resource_fields.clone(),
                     vec![
-                        Arc::new(UInt16Array::new_null(3)),
+                        Arc::new(UInt32Array::new_null(3)),
                         Arc::new(StringArray::new_null(3)),
                         Arc::new(UInt32Array::new_null(3)),
                     ],
