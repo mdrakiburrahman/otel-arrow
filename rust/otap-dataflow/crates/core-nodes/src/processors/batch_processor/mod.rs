@@ -108,6 +108,7 @@ const fn wakeup_slot(format: SignalFormat, signal: SignalType) -> WakeupSlot {
     let format_base = match format {
         SignalFormat::OtapRecords => 0,
         SignalFormat::OtlpBytes => 3,
+        SignalFormat::PluggableArrowRecords => 6,
     };
     let signal_offset = match signal {
         SignalType::Logs => 0,
@@ -125,6 +126,9 @@ const fn signal_from_wakeup_slot(slot: WakeupSlot) -> Option<(SignalFormat, Sign
         3 => Some((SignalFormat::OtlpBytes, SignalType::Logs)),
         4 => Some((SignalFormat::OtlpBytes, SignalType::Metrics)),
         5 => Some((SignalFormat::OtlpBytes, SignalType::Traces)),
+        6 => Some((SignalFormat::PluggableArrowRecords, SignalType::Logs)),
+        7 => Some((SignalFormat::PluggableArrowRecords, SignalType::Metrics)),
+        8 => Some((SignalFormat::PluggableArrowRecords, SignalType::Traces)),
         _ => None,
     }
 }
@@ -470,6 +474,12 @@ impl FormatConfig {
         let (expect_sizer, with_msg) = match format {
             SignalFormat::OtapRecords => (Sizer::Items, "OTAP batch sizer: must be items"),
             SignalFormat::OtlpBytes => (Sizer::Bytes, "OTLP batch sizer: must be bytes"),
+            SignalFormat::PluggableArrowRecords => {
+                return Err(ConfigError::InvalidUserConfig {
+                    error: "batch processor does not support pluggable Arrow representations"
+                        .into(),
+                });
+            }
         };
         if self.sizer != expect_sizer {
             return Err(ConfigError::InvalidUserConfig {
@@ -861,6 +871,18 @@ impl BatchProcessor {
                 } else {
                     return Err(Self::no_active_format_error());
                 }
+            }
+            PayloadData::PdataArrowRecords(records) => {
+                let reason = format!(
+                    "batch processor does not support pdata representation `{}`",
+                    records.representation()
+                );
+                effect
+                    .notify_nack(NackMsg::new_permanent(
+                        reason,
+                        OtapPdata::new(ctx, records.into()),
+                    ))
+                    .await?;
             }
         };
         Ok(())
@@ -1438,6 +1460,7 @@ impl local::Processor<OtapPdata> for BatchProcessor {
                                     .await?;
                             }
                         }
+                        SignalFormat::PluggableArrowRecords => {}
                     };
 
                     Ok(())
@@ -3584,6 +3607,9 @@ mod tests {
                     match output.signal_format() {
                         SignalFormat::OtapRecords => has_otap = true,
                         SignalFormat::OtlpBytes => has_otlp = true,
+                        SignalFormat::PluggableArrowRecords => {
+                            panic!("batch processor must not emit pluggable Arrow records")
+                        }
                     }
                 }
 

@@ -404,6 +404,12 @@ fn encode_payload(
                 encode_traces(&view, frame, max_frame_bytes)?;
             }
         },
+        PayloadData::PdataArrowRecords(records) => {
+            return Err(EncodeFailure::View(format!(
+                "file exporter does not support pdata representation `{}`",
+                records.representation()
+            )));
+        }
     }
     Ok(())
 }

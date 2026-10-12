@@ -463,6 +463,14 @@ impl ConsoleExporter {
                     Err(ConsoleExportErrorType::OtapViewCreation)
                 }
             },
+            PayloadData::PdataArrowRecords(records) => {
+                otel_warn!(
+                    "console.logs_view.unsupported_representation",
+                    representation = %records.representation(),
+                    message = "Console exporter requires standard OTAP or OTLP pdata"
+                );
+                Err(ConsoleExportErrorType::UnsupportedSignal)
+            }
         }
     }
 
@@ -504,6 +512,14 @@ impl ConsoleExporter {
                     Err(ConsoleExportErrorType::OtapViewCreation)
                 }
             },
+            PayloadData::PdataArrowRecords(records) => {
+                otel_warn!(
+                    "console.metrics_view.unsupported_representation",
+                    representation = %records.representation(),
+                    message = "Console exporter requires standard OTAP or OTLP pdata"
+                );
+                Err(ConsoleExportErrorType::UnsupportedSignal)
+            }
         }
     }
 

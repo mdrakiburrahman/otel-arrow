@@ -103,9 +103,11 @@ use otel_arrow_dfe_otap::OTAP_PROCESSOR_FACTORIES;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::TryIntoWithOptions;
 
+pub use bundle_adapter::{BundleConversionError, QuiverRepresentationCapability};
 use bundle_adapter::{
-    OtapRecordBundleAdapter, OtlpBytesAdapter, convert_bundle_to_pdata, recover_byte_count,
-    recover_item_count, signal_type_from_slot_id,
+    OtapRecordBundleAdapter, OtlpBytesAdapter, convert_bundle_to_pdata,
+    ensure_quiver_payload_supported, recover_byte_count, recover_item_count,
+    signal_type_from_slot_id,
 };
 pub use config::{DurableBufferConfig, OtlpHandling, SizeCapPolicy};
 use deferred_retry_state::DeferredRetryState;
@@ -1092,6 +1094,26 @@ impl DurableBuffer {
                     Err(e) => Err((e, OtapPayload::from(adapter.into_inner()))),
                 };
                 (result, num_items)
+            }
+            PayloadData::PdataArrowRecords(records) => {
+                let original_payload = OtapPayload::from(records);
+                let error = ensure_quiver_payload_supported(original_payload.data())
+                    .expect_err("pluggable Arrow persistence must remain fail-closed");
+                self.metrics
+                    .ingest_for(IngestFailure::Error)
+                    .failures
+                    .add(1);
+                otel_error!(
+                    "durable_buffer.representation.unsupported",
+                    error = %error
+                );
+                effect_handler
+                    .notify_nack(NackMsg::new_permanent(
+                        error.to_string(),
+                        OtapPdata::new(context, original_payload),
+                    ))
+                    .await?;
+                return Ok(());
             }
         };
 

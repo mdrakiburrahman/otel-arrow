@@ -472,6 +472,20 @@ impl AzureMonitorExporter {
                 *msg_id += 1;
                 let (context, payload) = pdata.into_parts();
 
+                if let PayloadData::PdataArrowRecords(records) = payload.data() {
+                    let reason = format!(
+                        "Azure Monitor exporter does not support pdata representation `{}`",
+                        records.representation()
+                    );
+                    effect_handler
+                        .notify_nack(NackMsg::new_permanent(
+                            reason,
+                            OtapPdata::new(context, payload),
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+
                 let log_entries = match payload.data() {
                     PayloadData::OtapArrowRecords(otap_records) => match otap_records {
                         OtapArrowRecords::Logs(_) => {
@@ -507,6 +521,7 @@ impl AzureMonitorExporter {
                             None
                         }
                     },
+                    PayloadData::PdataArrowRecords(_) => None,
                 };
 
                 if let Some(log_entries) = log_entries {

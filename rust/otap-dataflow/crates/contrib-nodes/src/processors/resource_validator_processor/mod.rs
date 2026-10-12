@@ -517,6 +517,16 @@ impl local::Processor<OtapPdata> for ResourceValidatorProcessor {
                             }
                         }
                     },
+                    PayloadData::PdataArrowRecords(records) => {
+                        let failure = ValidationFailure::ConversionError;
+                        Err((
+                            failure,
+                            format!(
+                                "resource validator does not support pdata representation `{}`",
+                                records.representation()
+                            ),
+                        ))
+                    }
                 };
 
                 self.record_validation_failure(&validation_result);

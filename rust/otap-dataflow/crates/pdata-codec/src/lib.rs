@@ -1,8 +1,9 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pluggable codecs between independently decodable bytes and native OTAP.
+//! Pluggable byte and Arrow representation codecs for native OTAP.
 
+mod arrow;
 mod decoder;
 mod encoder;
 mod error;
@@ -14,14 +15,18 @@ mod view;
 
 mod codecs;
 
+pub use arrow::{
+    ArrowCodecMetadata, ArrowCodecRegistration, PDATA_ARROW_CODEC_FACTORIES, PdataArrowDecoder,
+    PdataArrowEncoder, ResolvedArrowCodec,
+};
 pub use decoder::{DecodePolicy, DecodeValidation, PdataDecoder};
 pub use encoder::{EncodeOutput, PdataEncoder};
 pub use error::{CodecError, CodecOperation, RegistryError};
 pub use identity::{EncodedPdata, PdataEncoding};
 pub use plan::{EncodePolicy, EncodingPlan, InspectionPlan};
 pub use registry::{
-    CodecMetadata, CodecRegistration, CodecRegistry, ItemCounter, PDATA_CODEC_FACTORIES,
-    ResolvedCodec,
+    CodecCapabilities, CodecMetadata, CodecRegistration, CodecRegistry, ItemCounter,
+    PDATA_CODEC_FACTORIES, ResolvedCodec,
 };
 pub use runtime::{CodecService, CodecServiceBuilder};
 pub use view::{EncodedView, PdataView};
@@ -44,6 +49,21 @@ macro_rules! register_pdata_codec {
         #[$crate::__private::distributed_slice($crate::PDATA_CODEC_FACTORIES)]
         #[linkme(crate = $crate::__private)]
         static $name: $crate::CodecRegistration = $registration;
+    };
+}
+
+/// Registers a named, versioned Arrow representation codec at link time.
+///
+/// The registration expression must be const evaluable. Registry validation
+/// rejects duplicate identities independently of linker order. Encode and
+/// decode factories are optional; registration alone enables pass-through.
+#[macro_export]
+macro_rules! register_pdata_arrow_codec {
+    ($name:ident, $registration:expr $(,)?) => {
+        #[allow(unsafe_code)]
+        #[$crate::__private::distributed_slice($crate::PDATA_ARROW_CODEC_FACTORIES)]
+        #[linkme(crate = $crate::__private)]
+        static $name: $crate::ArrowCodecRegistration = $registration;
     };
 }
 

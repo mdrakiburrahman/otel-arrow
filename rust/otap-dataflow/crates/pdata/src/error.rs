@@ -7,6 +7,7 @@ use crate::otlp::common::EncodeFailure;
 use crate::otlp::metrics::MetricType;
 use crate::{
     otlp::attributes::AttributeValueType, proto::opentelemetry::arrow::v1::ArrowPayloadType,
+    representation::PdataRepresentation,
 };
 use arrow::datatypes::DataType;
 use arrow::error::ArrowError;
@@ -256,6 +257,12 @@ pub enum Error {
 
     #[error("Unsupported batch store type: no OTAP signal has batch width {batch_width}")]
     UnsupportedBatchStoreType { batch_width: usize },
+
+    #[error("pdata representation `{representation}` does not support {operation}")]
+    UnsupportedRepresentation {
+        representation: PdataRepresentation,
+        operation: &'static str,
+    },
 }
 
 impl From<EncodeFailure> for Error {

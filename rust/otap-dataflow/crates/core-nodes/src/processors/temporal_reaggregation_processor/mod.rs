@@ -648,6 +648,16 @@ impl TemporalReaggregationProcessor {
                 let view = RawMetricsData::new(otlp.as_bytes());
                 self.process_view(effect_handler, &view).await
             }
+            PayloadData::PdataArrowRecords(records) => {
+                let reason = format!(
+                    "temporal reaggregation requires standard OTAP or OTLP pdata; unsupported representation `{}`",
+                    records.representation()
+                );
+                effect_handler
+                    .notify_nack(NackMsg::new_permanent(reason, pdata))
+                    .await?;
+                return Ok(());
+            }
         };
 
         match result {

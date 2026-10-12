@@ -408,6 +408,7 @@ mod tests {
             match arrow_payload.into_data() {
                 PayloadData::OtapArrowRecords(records) => records.root_payload_type(),
                 PayloadData::OtlpBytes(_) => unreachable!(),
+                PayloadData::PdataArrowRecords(_) => unreachable!(),
             },
             ArrowPayloadType::Logs
         );
