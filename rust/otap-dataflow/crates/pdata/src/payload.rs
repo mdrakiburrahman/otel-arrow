@@ -10,6 +10,8 @@
 //!   what we'd receive from the OTAP GRPC service.
 //! - OTAP Arrow Records - the data is contained in Arrow `[RecordBatch]`s organized by
 //!   for efficient access by the arrow payload type.
+//! - Pluggable Arrow Records - an adapter-defined, named, and versioned set of
+//!   Arrow `RecordBatch` values with format-local table and schema identities.
 //!
 //! This module also contains conversions between the various types using the `From`
 //! and `TryFrom` traits. For example:
@@ -90,6 +92,7 @@ use crate::otlp::metrics::MetricsProtoBytesEncoder;
 use crate::otlp::traces::TracesProtoBytesEncoder;
 use crate::otlp::{OtlpProtoBytes, ProtoBuffer, ProtoBytesEncoder};
 use crate::proto::OtlpProtoMessage;
+use crate::representation::{PdataArrowRecordSet, PdataRepresentation};
 use crate::views::otlp::bytes::logs::RawLogsData;
 use crate::views::otlp::bytes::metrics::RawMetricsData;
 use crate::views::otlp::bytes::traces::RawTraceData;
@@ -154,6 +157,9 @@ pub enum PayloadData {
     /// data is contained in `OtapBatch` which contains Arrow `RecordBatches` for OTAP payload type
     /// TODO: Remove "Arrow" from this case name, it stutters; follow SignalFormat.
     OtapArrowRecords(OtapArrowRecords),
+
+    /// Adapter-defined Arrow tables whose identities are local to a registered representation.
+    PdataArrowRecords(Box<PdataArrowRecordSet>),
 }
 
 impl PayloadData {
@@ -161,6 +167,7 @@ impl PayloadData {
         match self {
             Self::OtlpBytes(value) => value.signal_type(),
             Self::OtapArrowRecords(value) => value.signal_type(),
+            Self::PdataArrowRecords(value) => value.signal_type(),
         }
     }
 
@@ -168,6 +175,7 @@ impl PayloadData {
         match self {
             Self::OtapArrowRecords(_) => SignalFormat::OtapRecords,
             Self::OtlpBytes(_) => SignalFormat::OtlpBytes,
+            Self::PdataArrowRecords(_) => SignalFormat::PluggableArrowRecords,
         }
     }
 
@@ -175,6 +183,7 @@ impl PayloadData {
         match self {
             Self::OtlpBytes(value) => value.is_empty(),
             Self::OtapArrowRecords(value) => value.is_empty(),
+            Self::PdataArrowRecords(value) => value.is_empty(),
         }
     }
 
@@ -183,6 +192,9 @@ impl PayloadData {
         match self {
             Self::OtlpBytes(value) => Self::OtlpBytes(value.take_payload()),
             Self::OtapArrowRecords(value) => Self::OtapArrowRecords(value.take_payload()),
+            Self::PdataArrowRecords(value) => {
+                Self::PdataArrowRecords(Box::new(value.take_payload()))
+            }
         }
     }
 
@@ -190,6 +202,7 @@ impl PayloadData {
         match self {
             Self::OtlpBytes(value) => value.num_items(),
             Self::OtapArrowRecords(value) => value.num_items(),
+            Self::PdataArrowRecords(value) => value.num_items(),
         }
     }
 
@@ -197,6 +210,7 @@ impl PayloadData {
         match self {
             Self::OtlpBytes(value) => Some(value.num_bytes()),
             Self::OtapArrowRecords(value) => value.num_bytes(),
+            Self::PdataArrowRecords(value) => value.logical_arrow_bytes().ok(),
         }
     }
 
@@ -204,6 +218,15 @@ impl PayloadData {
         match self {
             Self::OtlpBytes(value) => value.retained_memory_bytes(),
             Self::OtapArrowRecords(value) => value.retained_memory_bytes(),
+            Self::PdataArrowRecords(value) => value.retained_memory_bytes(),
+        }
+    }
+
+    fn representation(&self) -> PdataRepresentation {
+        match self {
+            Self::OtlpBytes(_) => PdataRepresentation::OTLP_BYTES,
+            Self::OtapArrowRecords(_) => PdataRepresentation::NATIVE_OTAP,
+            Self::PdataArrowRecords(value) => value.representation().clone(),
         }
     }
 }
@@ -257,6 +280,15 @@ impl OtapPayload {
         Self::from_data(PayloadData::OtapArrowRecords(payload))
     }
 
+    /// Constructs a fresh payload from a pluggable Arrow record set.
+    ///
+    /// Trust-boundary adapters should call `CodecService::admit_arrow` before
+    /// wrapping input received from outside the process.
+    #[must_use]
+    pub fn from_pdata_arrow(payload: PdataArrowRecordSet) -> Self {
+        Self::from_data(PayloadData::PdataArrowRecords(Box::new(payload)))
+    }
+
     /// Borrows the concrete payload data for pattern matching.
     #[must_use]
     pub fn data(&self) -> &PayloadData {
@@ -282,6 +314,12 @@ impl OtapPayload {
     #[must_use]
     pub fn signal_type(&self) -> SignalType {
         self.data.signal_type()
+    }
+
+    /// Returns the stable identity and version of the current representation.
+    #[must_use]
+    pub fn representation(&self) -> PdataRepresentation {
+        self.data.representation()
     }
 
     /// Returns the signal format.
@@ -327,7 +365,9 @@ impl OtapPayload {
                 item_count
             }
             // Bypass the cache for OTAP because Arrow batches store row counts.
-            PayloadData::OtapArrowRecords(_) => self.data.num_items(),
+            PayloadData::OtapArrowRecords(_) | PayloadData::PdataArrowRecords(_) => {
+                self.data.num_items()
+            }
         }
     }
 
@@ -343,6 +383,16 @@ impl OtapPayload {
             PayloadData::OtlpBytes(_) => self.data.num_bytes(),
             // Cache OTAP sizing because it walks every Arrow array and buffer.
             PayloadData::OtapArrowRecords(_) => {
+                if let Some(size) = self.size {
+                    return Some(size);
+                }
+                let size = self.data.num_bytes()?;
+                self.size = Some(size);
+                Some(size)
+            }
+            // Cache pluggable Arrow sizing because it also walks every table,
+            // array, and buffer.
+            PayloadData::PdataArrowRecords(_) => {
                 if let Some(size) = self.size {
                     return Some(size);
                 }
@@ -459,6 +509,32 @@ impl OtapPayloadHelpers for OtapArrowRecords {
             Self::Traces(records) => records.num_items(),
             Self::Metrics(records) => records.num_items(),
         }
+    }
+}
+
+impl OtapPayloadHelpers for PdataArrowRecordSet {
+    fn signal_type(&self) -> SignalType {
+        self.signal_type()
+    }
+
+    fn num_items(&self) -> usize {
+        self.num_items()
+    }
+
+    fn num_bytes(&self) -> Option<usize> {
+        self.logical_arrow_bytes().ok()
+    }
+
+    fn retained_memory_bytes(&self) -> usize {
+        self.retained_memory_bytes()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn take_payload(&mut self) -> Self {
+        self.take_payload()
     }
 }
 
@@ -683,6 +759,18 @@ impl From<OtlpProtoBytes> for OtapPayload {
     }
 }
 
+impl From<PdataArrowRecordSet> for OtapPayload {
+    fn from(value: PdataArrowRecordSet) -> Self {
+        Self::from_pdata_arrow(value)
+    }
+}
+
+impl From<Box<PdataArrowRecordSet>> for OtapPayload {
+    fn from(value: Box<PdataArrowRecordSet>) -> Self {
+        Self::from_data(PayloadData::PdataArrowRecords(value))
+    }
+}
+
 impl From<PayloadData> for OtapPayload {
     fn from(value: PayloadData) -> Self {
         Self::from_data(value)
@@ -699,6 +787,11 @@ impl TryFromWithOptions<OtapPayload> for OtapArrowRecords {
         match value.into_data() {
             PayloadData::OtapArrowRecords(value) => Ok(value),
             PayloadData::OtlpBytes(value) => value.try_into_with_options(opts),
+            PayloadData::PdataArrowRecords(value) => Err(Error::UnsupportedRepresentation {
+                representation: value.representation().clone(),
+                operation: "conversion to native OTAP",
+            }
+            .into()),
         }
     }
 }
@@ -713,6 +806,10 @@ impl TryFromWithOptions<OtapPayload> for OtlpProtoBytes {
         match value.into_data() {
             PayloadData::OtapArrowRecords(value) => value.try_into_with_options(opts),
             PayloadData::OtlpBytes(value) => Ok(value),
+            PayloadData::PdataArrowRecords(value) => Err(Error::UnsupportedRepresentation {
+                representation: value.representation().clone(),
+                operation: "conversion to OTLP protobuf bytes",
+            }),
         }
     }
 }

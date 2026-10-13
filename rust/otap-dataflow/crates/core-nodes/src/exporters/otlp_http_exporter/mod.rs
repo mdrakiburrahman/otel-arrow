@@ -584,6 +584,36 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
 
                             (Uncompressed::InProtoBuffer, otap_batch.into())
                         }
+                        PayloadData::PdataArrowRecords(records) => {
+                            let representation = records.representation().clone();
+                            let completed = attempt
+                                .run(async |attempt| {
+                                    Err::<(), _>(
+                                        attempt.failed(OtlpHttpExporterErrorType::Encoding),
+                                    )
+                                })
+                                .await;
+                            let error_type = self
+                                .metrics
+                                .boundary
+                                .record(completed)
+                                .expect_err("unsupported representation attempt must fail");
+                            self.metrics.record_failure(signal_type, error_type);
+                            let reason = format!(
+                                "OTLP HTTP exporter does not support pdata representation `{representation}`"
+                            );
+                            notify_nack_with_diagnostics(
+                                &effect_handler,
+                                &mut self.metrics,
+                                signal_type,
+                                NackMsg::new_permanent(
+                                    reason,
+                                    OtapPdata::new(context, records.into()),
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
                     };
 
                     let uncompressed_slice: &[u8] = match &uncompressed {

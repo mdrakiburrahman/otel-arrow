@@ -17,6 +17,9 @@
 //! actually convert the existing columns to all be the same type. Parquet writer is able to accept
 //! logically compatible types, which includes compatibility between types like `T` (native array)
 //! and `Dictionary<K, T>` (for any `K`).
+//!
+//! Fixed-size-binary dictionaries are an exception: normalize them to native arrays to avoid
+//! Parquet's dictionary write path adding variable-length byte-array prefixes to fixed-width IDs.
 
 use std::iter::repeat_n;
 use std::sync::{Arc, LazyLock};
@@ -27,6 +30,7 @@ use arrow::array::{
     StructArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use otel_arrow_dfe_pdata::schema::{FieldExt, UTC_TIME_ZONE, consts};
@@ -133,6 +137,19 @@ fn transform_to_known_schema_internal(
                     )?;
 
                     Arc::new(new_struct_arr)
+                } else if let DataType::Dictionary(_, value_type) = current_column.data_type()
+                    && matches!(value_type.as_ref(), DataType::FixedSizeBinary(_))
+                {
+                    // Work around arrow-rs #11261: its byte-array dictionary writer emits length
+                    // prefixes even though these columns have physical type FIXED_LEN_BYTE_ARRAY.
+                    cast(current_column, value_type).map_err(|error| {
+                        ParquetExporterError::InvalidRecordBatch {
+                            error: format!(
+                                "could not normalize fixed-size-binary column '{}': {error}",
+                                current_field.name()
+                            ),
+                        }
+                    })?
                 } else {
                     // otherwise just keep the existing column
                     current_column.clone()
@@ -334,7 +351,7 @@ fn get_template_schema(
 
 static RESOURCE_TEMPLATE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![
-        Field::new(consts::ID, DataType::UInt16, true),
+        Field::new(consts::ID, DataType::UInt32, true),
         Field::new(consts::SCHEMA_URL, DataType::Utf8, true),
         Field::new(consts::DROPPED_ATTRIBUTES_COUNT, DataType::UInt32, true),
     ])
@@ -342,7 +359,7 @@ static RESOURCE_TEMPLATE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
 
 static SCOPE_TEMPLATE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![
-        Field::new(consts::ID, DataType::UInt16, true),
+        Field::new(consts::ID, DataType::UInt32, true),
         Field::new(consts::NAME, DataType::Utf8, true),
         Field::new(consts::VERSION, DataType::Utf8, true),
         Field::new(consts::DROPPED_ATTRIBUTES_COUNT, DataType::UInt32, true),
@@ -351,7 +368,7 @@ static SCOPE_TEMPLATE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
 
 static LOGS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
-        Field::new(consts::ID, DataType::UInt16, true),
+        Field::new(consts::ID, DataType::UInt32, true),
         Field::new(
             consts::RESOURCE,
             DataType::Struct(RESOURCE_TEMPLATE_FIELDS.clone()),
@@ -402,7 +419,7 @@ static LOGS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 
 static METRICS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
-        Field::new(consts::ID, DataType::UInt16, true),
+        Field::new(consts::ID, DataType::UInt32, true),
         Field::new(
             consts::RESOURCE,
             DataType::Struct(RESOURCE_TEMPLATE_FIELDS.clone()),
@@ -426,7 +443,7 @@ static METRICS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static NUMBERS_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, false),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(
             consts::START_TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
@@ -446,7 +463,7 @@ static NUMBERS_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static SUMMARY_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, false),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(
             consts::START_TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
@@ -478,7 +495,7 @@ static SUMMARY_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static HISTOGRAM_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, false),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(
             consts::START_TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
@@ -510,7 +527,7 @@ static HISTOGRAM_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static EXP_HISTOGRAM_DP_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, false),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(
             consts::START_TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
@@ -573,7 +590,7 @@ static EXEMPLAR_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 
 static SPANS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
-        Field::new(consts::ID, DataType::UInt16, true),
+        Field::new(consts::ID, DataType::UInt32, true),
         Field::new(
             consts::RESOURCE,
             DataType::Struct(RESOURCE_TEMPLATE_FIELDS.clone()),
@@ -618,7 +635,7 @@ static SPANS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static SPAN_EVENTS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, true),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(
             consts::TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
@@ -632,7 +649,7 @@ static SPAN_EVENTS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 static SPAN_LINKS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(consts::ID, DataType::UInt32, true),
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(consts::TRACE_ID, DataType::FixedSizeBinary(16), true),
         Field::new(consts::SPAN_ID, DataType::FixedSizeBinary(8), true),
         Field::new(consts::TRACE_STATE, DataType::Utf8, true),
@@ -642,7 +659,7 @@ static SPAN_LINKS_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 
 static ATTRS_16_TEMPLATE_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::new(vec![
-        Field::new(consts::PARENT_ID, DataType::UInt16, false),
+        Field::new(consts::PARENT_ID, DataType::UInt32, false),
         Field::new(consts::ATTRIBUTE_KEY, DataType::Utf8, false),
         Field::new(consts::ATTRIBUTE_TYPE, DataType::UInt8, false),
         Field::new(consts::ATTRIBUTE_STR, DataType::Utf8, true),
@@ -677,6 +694,210 @@ mod test {
     };
     use pretty_assertions::assert_eq;
 
+    /// Scenario: OTLP protobuf logs carry distinct, repeated, and absent IDs across chunks and row groups.
+    /// Guarantees: Arrow conversion and physical Parquet columns preserve every trace/span ID byte and null.
+    #[test]
+    fn test_otlp_log_ids_preserved_in_parquet() {
+        use bytes::Bytes;
+        use otel_arrow_dfe_pdata::{
+            OtlpProtoBytes, TryFromWithOptions,
+            arrays::{ByteArrayAccessor, NullableArrayAccessor},
+            otap::OtapArrowRecords,
+            proto::opentelemetry::{
+                collector::logs::v1::ExportLogsServiceRequest,
+                logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+            },
+        };
+        use parquet::{
+            arrow::ArrowWriter,
+            basic::Type,
+            column::reader::ColumnReader,
+            file::{
+                properties::WriterProperties,
+                reader::{FileReader, SerializedFileReader},
+            },
+        };
+        use prost::Message;
+
+        // Exercise both dictionary key widths and the encoder's 64-record chunk boundary.
+        for distinct_count in [3u16, 260] {
+            let mut expected_ids = vec![None];
+            for index in 0..distinct_count {
+                let mut trace_id = *b"0123456789abcdef";
+                trace_id[..2].copy_from_slice(&index.to_be_bytes());
+                let mut span_id = *b"76543210";
+                span_id[..2].copy_from_slice(&index.to_be_bytes());
+                expected_ids.push(Some((trace_id, span_id)));
+            }
+            expected_ids.push(expected_ids[1]);
+            expected_ids.push(None);
+            let request = ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    scope_logs: vec![ScopeLogs {
+                        log_records: expected_ids
+                            .iter()
+                            .map(|ids| {
+                                let (trace_id, span_id) = ids
+                                    .map(|(trace_id, span_id)| {
+                                        (trace_id.to_vec(), span_id.to_vec())
+                                    })
+                                    .unwrap_or_default();
+                                LogRecord {
+                                    trace_id,
+                                    span_id,
+                                    ..Default::default()
+                                }
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            };
+            let otap = OtapArrowRecords::try_from_with_default(OtlpProtoBytes::ExportLogsRequest(
+                Bytes::from(request.encode_to_vec()),
+            ))
+            .unwrap();
+            let logs = otap.get(ArrowPayloadType::Logs).unwrap();
+            for (name, width) in [(consts::TRACE_ID, 16), (consts::SPAN_ID, 8)] {
+                let column = logs.column_by_name(name).unwrap();
+                let key_type = if distinct_count <= u16::from(u8::MAX) {
+                    DataType::UInt8
+                } else {
+                    DataType::UInt16
+                };
+                assert_eq!(
+                    column.data_type(),
+                    &DataType::Dictionary(
+                        Box::new(key_type),
+                        Box::new(DataType::FixedSizeBinary(width))
+                    )
+                );
+                let accessor = ByteArrayAccessor::try_new(column).unwrap();
+                for (row, ids) in expected_ids.iter().enumerate() {
+                    let expected = ids.as_ref().map(|(trace_id, span_id)| {
+                        if width == 16 {
+                            trace_id.as_slice()
+                        } else {
+                            span_id.as_slice()
+                        }
+                    });
+                    assert_eq!(accessor.value_at(row).as_deref(), expected);
+                }
+            }
+
+            let mut records = OtapParquetRecords::from(otap);
+            transform_to_known_schema(&mut records).unwrap();
+            let logs = records.get(ArrowPayloadType::Logs).unwrap();
+            assert_eq!(
+                logs.column_by_name(consts::TRACE_ID).unwrap().data_type(),
+                &DataType::FixedSizeBinary(16)
+            );
+            assert_eq!(
+                logs.column_by_name(consts::SPAN_ID).unwrap().data_type(),
+                &DataType::FixedSizeBinary(8)
+            );
+
+            for dictionary_enabled in [true, false] {
+                let properties = WriterProperties::builder()
+                    .set_dictionary_enabled(dictionary_enabled)
+                    .build();
+                let mut writer =
+                    ArrowWriter::try_new(Vec::new(), logs.schema(), Some(properties)).unwrap();
+                let split = logs.num_rows() / 2;
+                writer.write(&logs.slice(0, split)).unwrap();
+                writer.flush().unwrap();
+                writer
+                    .write(&logs.slice(split, logs.num_rows() - split))
+                    .unwrap();
+                let reader =
+                    SerializedFileReader::new(Bytes::from(writer.into_inner().unwrap())).unwrap();
+                assert_eq!(reader.num_row_groups(), 2);
+
+                for (group_index, (start, count)) in [(0, split), (split, logs.num_rows() - split)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let group = reader.get_row_group(group_index).unwrap();
+                    for (name, width) in [(consts::TRACE_ID, 16), (consts::SPAN_ID, 8)] {
+                        let schema = group.metadata().schema_descr();
+                        let column_index = schema
+                            .columns()
+                            .iter()
+                            .position(|column| column.path().string() == name)
+                            .unwrap();
+                        let descriptor = schema.column(column_index);
+                        assert_eq!(descriptor.physical_type(), Type::FIXED_LEN_BYTE_ARRAY);
+                        assert_eq!(descriptor.type_length(), width);
+                        // Read the physical type, not Arrow dictionary metadata: a writer/reader
+                        // round trip through the same faulty dictionary path can hide corruption.
+                        let ColumnReader::FixedLenByteArrayColumnReader(mut column) =
+                            group.get_column_reader(column_index).unwrap()
+                        else {
+                            panic!("expected fixed-length ID column");
+                        };
+                        let mut levels = Vec::new();
+                        let mut values = Vec::new();
+                        let (records_read, values_read, levels_read) = column
+                            .read_records(count, Some(&mut levels), None, &mut values)
+                            .unwrap();
+                        assert_eq!(records_read, count);
+                        assert_eq!(levels_read, count);
+                        let expected = &expected_ids[start..start + count];
+                        assert_eq!(values_read, expected.iter().flatten().count());
+                        let mut values = values.iter();
+                        for (ids, level) in expected.iter().zip(levels) {
+                            assert_eq!(level, i16::from(ids.is_some()));
+                            if let Some((trace_id, span_id)) = ids {
+                                let expected = if width == 16 {
+                                    trace_id.as_slice()
+                                } else {
+                                    span_id.as_slice()
+                                };
+                                assert_eq!(values.next().unwrap().data(), expected);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scenario: span IDs already use native fixed-size-binary columns before Parquet normalization.
+    /// Guarantees: normalization reuses their buffers without changing their types or ID bytes.
+    #[test]
+    fn test_native_span_ids_unchanged() {
+        let trace_ids: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_iter(
+                [*b"0123456789abcdef", *b"fedcba9876543210"].into_iter(),
+            )
+            .unwrap(),
+        );
+        let span_ids: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_iter([*b"01234567", *b"76543210"].into_iter()).unwrap(),
+        );
+        let spans = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(consts::TRACE_ID, DataType::FixedSizeBinary(16), false),
+                Field::new(consts::SPAN_ID, DataType::FixedSizeBinary(8), false),
+            ])),
+            vec![trace_ids.clone(), span_ids.clone()],
+        )
+        .unwrap();
+        let normalized =
+            transform_record_batch_to_known_schema(&spans, ArrowPayloadType::Spans).unwrap();
+        assert!(Arc::ptr_eq(
+            normalized.column_by_name(consts::TRACE_ID).unwrap(),
+            &trace_ids
+        ));
+        assert!(Arc::ptr_eq(
+            normalized.column_by_name(consts::SPAN_ID).unwrap(),
+            &span_ids
+        ));
+    }
+
+    /// Scenario: an input batch omits resource/body fields and includes a partial scope struct.
+    /// Guarantees: missing IDs use the widened file schema while existing values and nullability are retained.
     #[test]
     fn test_coalesces_new_columns_with_empty_columns() {
         let log_attrs_record_batch = RecordBatch::try_new(
@@ -716,7 +937,7 @@ mod test {
                 .unwrap();
 
         let expected_resource_fields = Fields::from(vec![
-            Field::new(consts::ID, DataType::UInt16, true),
+            Field::new(consts::ID, DataType::UInt32, true),
             Field::new(consts::SCHEMA_URL, DataType::Utf8, true),
             Field::new(consts::DROPPED_ATTRIBUTES_COUNT, DataType::UInt32, true),
         ]);
@@ -781,7 +1002,7 @@ mod test {
                 Arc::new(StructArray::new(
                     expected_resource_fields.clone(),
                     vec![
-                        Arc::new(UInt16Array::new_null(3)),
+                        Arc::new(UInt32Array::new_null(3)),
                         Arc::new(StringArray::new_null(3)),
                         Arc::new(UInt32Array::new_null(3)),
                     ],

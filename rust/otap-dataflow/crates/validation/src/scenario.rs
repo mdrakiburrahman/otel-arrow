@@ -564,6 +564,45 @@ nodes:
         assert!(rendered.contains("cap:"));
     }
 
+    /// Scenario: generator output is fanned out to SUV and control network exporters.
+    /// Guarantees: each branch retries transient startup refusal independently with a bounded deadline.
+    #[test]
+    fn generator_retries_network_branches_independently() {
+        let mut scenario = Scenario::new()
+            .pipeline(Pipeline::from_yaml(sample_yaml()).unwrap())
+            .add_generator("gen", Generator::logs().otlp_grpc("receiver"))
+            .add_capture(
+                "cap",
+                Capture::default()
+                    .otap_grpc("exporter")
+                    .control_streams(["gen"]),
+            );
+        scenario.update_configs().unwrap();
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&scenario.render_generators().unwrap()).unwrap();
+        let generator = &yaml["gen"];
+        for name in ["suv_retry", "control_retry1"] {
+            assert_eq!(generator["nodes"][name]["type"], "urn:otel:processor:retry");
+            assert_eq!(
+                generator["nodes"][name]["config"]["max_elapsed_time"],
+                "10s"
+            );
+        }
+        let connections = generator["connections"].as_sequence().unwrap();
+        for (from, to) in [
+            ("fanout[\"suv_port\"]", "suv_retry"),
+            ("suv_retry", "suv_exporter"),
+            ("fanout[\"control_port1\"]", "control_retry1"),
+            ("control_retry1", "control_exporter1"),
+        ] {
+            assert!(
+                connections
+                    .iter()
+                    .any(|connection| connection["from"] == from && connection["to"] == to)
+            );
+        }
+    }
+
     #[test]
     fn add_container_stores_config() {
         let scenario = Scenario::new()

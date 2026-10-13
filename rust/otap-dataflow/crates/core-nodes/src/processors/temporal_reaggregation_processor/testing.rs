@@ -350,6 +350,9 @@ fn payload_to_otlp(payload: &OtapPayload) -> otel_arrow_dfe_pdata::proto::OtlpPr
         PayloadData::OtlpBytes(bytes) => {
             otel_arrow_dfe_pdata::testing::round_trip::otlp_bytes_to_message(bytes.clone())
         }
+        PayloadData::PdataArrowRecords(_) => {
+            panic!("temporal reaggregation tests require standard pdata")
+        }
     }
 }
 

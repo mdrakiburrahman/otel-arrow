@@ -1632,6 +1632,16 @@ impl GenevaExporter {
                     }
                 }
             }
+            PayloadData::PdataArrowRecords(records) => {
+                self.metrics.record_failure(
+                    records.signal_type(),
+                    GenevaExporterErrorType::UnsupportedSignal,
+                );
+                Err(GenevaExportError::refused(format!(
+                    "Geneva exporter does not support pdata representation `{}`",
+                    records.representation()
+                )))
+            }
         }
     }
 }

@@ -4,10 +4,13 @@
 use std::error::Error as StdError;
 
 use crate::PdataEncoding;
+use otel_arrow_dfe_pdata::PdataRepresentation;
 
 /// Operation being performed by a codec.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodecOperation {
+    /// Preserve a registered representation without conversion.
+    PassThrough,
     /// Convert encoded bytes to native OTAP.
     Decode,
     /// Convert native OTAP to encoded bytes.
@@ -17,6 +20,7 @@ pub enum CodecOperation {
 impl std::fmt::Display for CodecOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::PassThrough => "pass through",
             Self::Decode => "decode",
             Self::Encode => "encode",
         })
@@ -64,6 +68,32 @@ pub enum RegistryError {
         /// Missing identity.
         encoding: PdataEncoding,
     },
+    /// A pluggable Arrow representation name or version is invalid.
+    #[error("invalid pdata Arrow representation `{representation}`: {reason}")]
+    InvalidArrowIdentity {
+        /// Invalid representation identity.
+        representation: PdataRepresentation,
+        /// Validation failure.
+        reason: &'static str,
+    },
+    /// More than one Arrow codec registered the same identity and version.
+    #[error("duplicate pdata Arrow codec registration `{representation}`")]
+    DuplicateArrow {
+        /// Duplicated representation identity.
+        representation: PdataRepresentation,
+    },
+    /// An Arrow registration has no supported signals.
+    #[error("pdata Arrow representation `{representation}` has no supported signals")]
+    EmptyArrowSignals {
+        /// Invalid registration identity.
+        representation: PdataRepresentation,
+    },
+    /// The requested Arrow representation is not linked into this binary.
+    #[error("no pdata Arrow codec registered for `{representation}`")]
+    ArrowNotFound {
+        /// Missing representation identity.
+        representation: PdataRepresentation,
+    },
 }
 
 /// Codec resolution or execution failure.
@@ -90,11 +120,40 @@ pub enum CodecError {
         /// Requested signal.
         signal: otel_arrow_dfe_config::SignalType,
     },
+    /// A registered Arrow codec does not implement the requested operation.
+    #[error("pdata Arrow codec `{representation}` cannot {operation}")]
+    UnsupportedArrowCodecOperation {
+        /// Representation identity.
+        representation: PdataRepresentation,
+        /// Requested operation.
+        operation: CodecOperation,
+    },
+    /// A registered Arrow codec does not support an operation for this signal.
+    #[error("pdata Arrow codec `{representation}` cannot {operation} {signal:?}")]
+    UnsupportedArrow {
+        /// Representation identity.
+        representation: PdataRepresentation,
+        /// Requested operation.
+        operation: CodecOperation,
+        /// Requested signal.
+        signal: otel_arrow_dfe_config::SignalType,
+    },
     /// A codec failed while processing telemetry.
     #[error("pdata codec `{encoding}` failed to {operation}: {source}")]
     Operation {
         /// Codec identity.
         encoding: PdataEncoding,
+        /// Failed operation.
+        operation: CodecOperation,
+        /// Original error, retained for diagnostics.
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+    /// An Arrow codec failed while processing telemetry.
+    #[error("pdata Arrow codec `{representation}` failed to {operation}: {source}")]
+    ArrowOperation {
+        /// Representation identity.
+        representation: PdataRepresentation,
         /// Failed operation.
         operation: CodecOperation,
         /// Original error, retained for diagnostics.
@@ -110,6 +169,24 @@ pub enum CodecError {
         expected: otel_arrow_dfe_config::SignalType,
         /// Signal produced by the decoder.
         actual: otel_arrow_dfe_config::SignalType,
+    },
+    /// An Arrow decoder or encoder returned a different signal.
+    #[error("pdata Arrow codec `{representation}` produced {actual:?}, expected {expected:?}")]
+    ArrowSignalChanged {
+        /// Representation identity.
+        representation: PdataRepresentation,
+        /// Signal supplied to the codec.
+        expected: otel_arrow_dfe_config::SignalType,
+        /// Signal produced by the codec.
+        actual: otel_arrow_dfe_config::SignalType,
+    },
+    /// An Arrow encoder returned a different representation identity.
+    #[error("pdata Arrow codec `{expected}` produced representation `{actual}`")]
+    ArrowRepresentationChanged {
+        /// Registered representation identity.
+        expected: PdataRepresentation,
+        /// Representation returned by the encoder.
+        actual: PdataRepresentation,
     },
     /// Codec state is already borrowed by another synchronous operation.
     #[error(
@@ -152,6 +229,39 @@ impl CodecError {
             self
         } else {
             Self::operation(encoding, operation, self)
+        }
+    }
+
+    /// Wraps an Arrow implementation error without losing its source chain.
+    pub fn arrow_operation(
+        representation: &PdataRepresentation,
+        operation: CodecOperation,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
+        Self::ArrowOperation {
+            representation: representation.clone(),
+            operation,
+            source: Box::new(source),
+        }
+    }
+
+    /// Ensures an Arrow implementation failure carries service-owned diagnostics.
+    pub(crate) fn with_arrow_operation_context(
+        self,
+        representation: &PdataRepresentation,
+        operation: CodecOperation,
+    ) -> Self {
+        if matches!(
+            &self,
+            Self::ArrowOperation {
+                representation: error_representation,
+                operation: error_operation,
+                ..
+            } if error_representation == representation && *error_operation == operation
+        ) {
+            self
+        } else {
+            Self::arrow_operation(representation, operation, self)
         }
     }
 }

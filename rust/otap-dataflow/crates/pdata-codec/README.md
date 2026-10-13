@@ -4,12 +4,18 @@ This crate is currently pre-1.0. Its public API may evolve between minor
 releases.
 
 This crate defines the extension boundary between independently decodable byte
-formats and native OTAP Arrow records in the OTel Arrow Dataflow Engine.
+formats, named Arrow record-set representations, and native OTAP Arrow records
+in the OTel Arrow Dataflow Engine.
+
+See [Pluggable Arrow pipeline data](../../docs/pluggable-arrow-pdata.md) for the
+in-memory Arrow carrier, wiring validation, Quiver status, and future Flight
+receiver integration boundary.
 
 Codecs describe an encoded representation, register immutable factories at link
 time, and keep mutable decoder or encoder state inside one pipeline runtime. A
-payload carries only its encoding identity, signal, bytes, and cached metadata;
-it never owns a codec instance.
+byte payload carries only its encoding identity, signal, bytes, and cached
+metadata. A pluggable Arrow payload carries its representation identity,
+format-local tables, and adapter metadata. Payloads never own codec instances.
 
 ## Design model
 
@@ -31,6 +37,10 @@ it never owns a codec instance.
   are decoded to native OTAP.
 - Native OTAP remains the mutable processing representation and the fallback
   intermediate for conversion between different encodings.
+- `PdataRepresentation` plus `RepresentationVersion` identifies both existing
+  compatibility representations and pluggable Arrow record sets.
+- `ArrowCodecRegistration` always permits pass-through and may optionally
+  register conversion to or from native OTAP.
 
 Every encoded payload must be independently decodable. Stream-relative state,
 such as a dictionary shared across batches, is not a pdata encoding unless each

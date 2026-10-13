@@ -614,6 +614,39 @@ impl Exporter<OtapPdata> for OTLPExporter {
                             let future = make_export_future(prepared, client);
                             inflight_exports.push(future);
                         }
+                        (_, PayloadData::PdataArrowRecords(records)) => {
+                            let representation = records.representation().clone();
+                            let completed = attempt
+                                .run(async |attempt| {
+                                    Err::<(), _>(
+                                        attempt.failed(OtlpGrpcExporterErrorType::Encoding),
+                                    )
+                                })
+                                .await;
+                            let error_type = self
+                                .metrics
+                                .boundary
+                                .record(completed)
+                                .expect_err("unsupported representation attempt must fail");
+                            self.metrics.record_failure(signal_type, error_type);
+                            let error = Error::ExporterError {
+                                exporter: exporter_id.clone(),
+                                kind: ExporterErrorKind::Configuration,
+                                error: format!(
+                                    "OTLP gRPC exporter does not support pdata representation `{representation}`"
+                                ),
+                                source_detail: String::new(),
+                            };
+                            _ = notify_prepare_error(
+                                Box::new(EncodingFailure {
+                                    error,
+                                    context,
+                                    saved_payload: records.into(),
+                                }),
+                                &effect_handler,
+                            )
+                            .await;
+                        }
                     }
                 }
                 _ => {

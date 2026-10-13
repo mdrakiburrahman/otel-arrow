@@ -100,15 +100,17 @@ mod tests {
             .expect("validation scenario failed");
     }
 
+    /// Scenario: synthetic logs are filtered on their thread name, then that key is renamed.
+    /// Guarantees: a nonempty captured stream has the renamed key and no original key.
     #[test]
     fn validation_attribute_processor_pipeline() {
         let deny = ValidationInstructions::AttributeDeny {
             domains: vec![AttributeDomain::Signal],
-            keys: vec!["ios.app.state".into()],
+            keys: vec!["thread.name".into()],
         };
         let require = ValidationInstructions::AttributeRequireKey {
             domains: vec![AttributeDomain::Signal],
-            keys: vec!["ios.app.state2".into()],
+            keys: vec!["thread.name.renamed".into()],
         };
         Scenario::new()
             .pipeline(
@@ -134,13 +136,15 @@ mod tests {
             .expect("attribute processor validation failed");
     }
 
+    /// Scenario: synthetic logs contain several thread names and a strict filter selects main.
+    /// Guarantees: captured logs retain the selected attribute and are compared with control traffic.
     #[test]
     fn validation_filter_processor_pipeline() {
         let attr_check = ValidationInstructions::AttributeRequireKeyValue {
             domains: vec![AttributeDomain::Signal],
             pairs: vec![KeyValue::new(
-                "ios.app.state".into(),
-                AnyValue::String("active".into()),
+                "thread.name".into(),
+                AnyValue::String("main".into()),
             )],
         };
 
@@ -616,9 +620,11 @@ mod tests {
             .expect("transform kql passthrough traces validation failed");
     }
 
-    /// Tests the transform processor OPL `exclude` operation. Removes the
+    /// Tests the transform processor OPL `remove` operation. Removes the
     /// `thread.id` attribute from every log record while preserving `thread.name`.
-    /// Query: `logs | exclude attributes["thread.id"]`
+    /// Query: `logs | remove attributes["thread.id"]`
+    /// Scenario: OPL removes the synthetic thread ID while retaining the thread name.
+    /// Guarantees: every captured log lacks thread.id and still contains thread.name.
     #[test]
     fn validation_transform_opl_exclude_attribute() {
         Scenario::new()
@@ -737,11 +743,13 @@ mod tests {
             .expect("transform opl conditional-set validation failed");
     }
 
-    /// Tests the transform processor with chained OPL `set` + `exclude`
+    /// Tests the transform processor with chained OPL `set` + `remove`
     /// operations. First adds a `processed` attribute, then removes
     /// `thread.id`. Both transformations must be reflected in the output.
-    /// Query: `logs | set attributes["processed"] = "yes" | exclude
+    /// Query: `logs | set attributes["processed"] = "yes" | remove
     ///   attributes["thread.id"]`
+    /// Scenario: OPL adds a marker and removes a synthetic attribute in one pipeline.
+    /// Guarantees: captured logs have processed and lack thread.id.
     #[test]
     fn validation_transform_opl_chained_set_exclude() {
         Scenario::new()

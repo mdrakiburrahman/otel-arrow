@@ -603,6 +603,7 @@ impl ContentRouter {
                     },
                 }
             }
+            PayloadData::PdataArrowRecords(_) => RouteResolution::ConversionError,
         }
     }
 
@@ -981,9 +982,14 @@ impl local::Processor<OtapPdata> for ContentRouter {
                         if let Some(m) = self.metrics.as_mut() {
                             m.record(Outcome::Failure, ContentRouterReason::ConversionError);
                         }
-                        let reason =
-                            "internal error: failed to convert telemetry format for routing"
-                                .to_string();
+                        let reason = match data.payload_ref().data() {
+                            PayloadData::PdataArrowRecords(records) => format!(
+                                "content router does not support pdata representation `{}`",
+                                records.representation()
+                            ),
+                            _ => "internal error: failed to convert telemetry format for routing"
+                                .to_string(),
+                        };
                         effect_handler
                             .notify_nack(NackMsg::new_permanent(reason, data))
                             .await?;

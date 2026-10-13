@@ -79,6 +79,8 @@ pub enum SignalFormat {
     OtapRecords,
     /// OTLP protobuf bytes
     OtlpBytes,
+    /// Registered pluggable Arrow record-set representation.
+    PluggableArrowRecords,
     // TODO: maybe add types not included in OtapPdata including
     // OtlpProtoMessage, OtapArrowBytes, and possible opaque.
 }

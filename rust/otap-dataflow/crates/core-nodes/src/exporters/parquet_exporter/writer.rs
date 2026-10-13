@@ -8,8 +8,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use futures::future::LocalBoxFuture;
 use futures::stream::FuturesUnordered;
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use otel_arrow_dfe_pdata::otap::child_payload_types;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -22,6 +23,53 @@ use thiserror::Error;
 use super::config::WriterOptions;
 use super::partition::PartitionAttribute;
 use super::records::OtapParquetRecords;
+
+/// A file backend whose completion makes its rows visible to readers.
+#[async_trait::async_trait(?Send)]
+pub trait FileSink {
+    /// Append prepared Arrow rows.
+    async fn write(&mut self, batch: &RecordBatch) -> Result<(), ParquetError>;
+    /// Close and publish the file, including any backend transaction.
+    async fn close(self: Box<Self>) -> Result<(), ParquetError>;
+    /// Finalize private data without publishing it. Ordinary Parquet defers close.
+    async fn stage(&mut self) -> Result<(), ParquetError> {
+        Ok(())
+    }
+    /// Publish during a forced drain, bypassing an external batching delay.
+    #[must_use]
+    async fn close_forced(self: Box<Self>) -> Result<(), ParquetError> {
+        self.close().await
+    }
+}
+
+/// Supplies file backends while retaining OTAP batching and visibility ordering.
+pub trait FileSinkFactory {
+    /// Create a backend for a payload's file path.
+    fn create(&self, path: &str, schema: SchemaRef) -> Result<Box<dyn FileSink>, ParquetError>;
+    /// Optional final preparation after the exporter's standard schema normalization.
+    fn prepare(&self, _records: &mut OtapParquetRecords) -> Result<(), ParquetError> {
+        Ok(())
+    }
+    /// Opt into local pipelined completion, bounded per payload type.
+    fn max_pending_files(&self) -> Option<usize> {
+        None
+    }
+    /// Force already submitted and subsequent files to complete during shutdown.
+    fn start_draining(&self) -> Result<(), ParquetError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl FileSink for AsyncArrowWriter<ParquetObjectWriter> {
+    async fn write(&mut self, batch: &RecordBatch) -> Result<(), ParquetError> {
+        AsyncArrowWriter::write(self, batch).await
+    }
+
+    async fn close(self: Box<Self>) -> Result<(), ParquetError> {
+        (*self).close().await.map(|_| ())
+    }
+}
 
 /// Aggregated stats returned by a write/flush cycle. Useful for internal telemetry and tests.
 #[derive(Debug, Default, Clone, Copy)]
@@ -57,6 +105,15 @@ struct FlushAttemptStats {
     flush_attempts: u64,
     flush_successes: u64,
     flush_failures: u64,
+}
+
+enum FlushEvent {
+    Staged(FileWriter, Result<(), ParquetError>),
+    Closed {
+        batch_ids: BTreeSet<i64>,
+        payload_type: ArrowPayloadType,
+        result: Result<(), ParquetError>,
+    },
 }
 
 /// Error returned by the writer with any flush stats collected before failure.
@@ -112,6 +169,8 @@ impl<'a> WriteBatch<'a> {
 pub struct WriterManager {
     object_store: Arc<dyn ObjectStore>,
     options: WriterOptions,
+    backend: Option<Arc<dyn FileSinkFactory>>,
+    close_failed: bool,
 
     // the current filename used for each path prefix. Prefixes in this case are based
     // on the payload type, and the partition attributes. There can be multiple files
@@ -128,6 +187,8 @@ pub struct WriterManager {
     // batch have been flushed. This is to ensure the parent record does not become
     // visible until all its children are flushed.
     pending_file_flushes: Vec<FileWriter>,
+    in_flight: FuturesUnordered<LocalBoxFuture<'static, FlushEvent>>,
+    files_by_type: HashMap<ArrowPayloadType, usize>,
 }
 
 impl WriterManager {
@@ -135,24 +196,50 @@ impl WriterManager {
         Self {
             object_store,
             options,
+            backend: None,
+            close_failed: false,
             curr_writer_for_prefix: HashMap::new(),
             unflushed_batches_state: UnflushedBatchState::new(),
             pending_file_flushes: Vec::new(),
+            in_flight: FuturesUnordered::new(),
+            files_by_type: HashMap::new(),
         }
     }
 
+    /// Replace only the file backend, retaining scheduling and dependency rules.
+    pub fn with_backend(mut self, backend: Arc<dyn FileSinkFactory>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
     pub async fn write(&mut self, writes: &[WriteBatch<'_>]) -> Result<WriteStats, WriteError> {
-        let mut stats = WriteStats::default();
+        if self.close_failed {
+            return Err(WriteError::from_flush_stats(
+                FlushAttemptStats::default(),
+                ParquetError::General(
+                    "previous file close failed; writer must be abandoned".into(),
+                ),
+            ));
+        }
+        // The inbox only bypasses admission to drain its bounded shutdown backlog.
+        // Make room for that one batch without growing the external file budget.
+        let mut stats = if self.is_backpressured() {
+            self.flush_all().await?
+        } else {
+            WriteStats::default()
+        };
         for write in writes {
             // schedule the writes for each payload type for this signal
             for payload_type in write.otap_batch.allowed_payload_types() {
                 if let Some(record_batch) = write.otap_batch.get(*payload_type) {
-                    let created = self.schedule_write_batch(
-                        write.batch_id,
-                        *payload_type,
-                        record_batch,
-                        write.partition_attributes,
-                    );
+                    let created = self
+                        .schedule_write_batch(
+                            write.batch_id,
+                            *payload_type,
+                            record_batch,
+                            write.partition_attributes,
+                        )
+                        .map_err(|error| WriteError { stats, error })?;
                     if created {
                         stats.files_created += 1;
                     }
@@ -176,6 +263,9 @@ impl WriterManager {
         let schedule_stats = self.schedule_flushes();
         stats.flush_scheduled_max_rows += schedule_stats.scheduled_max_rows;
         stats.flush_scheduled_max_age += schedule_stats.scheduled_max_age;
+        if self.is_backpressured() {
+            self.schedule_all();
+        }
 
         let attempt_stats = match self.attempt_flush_scheduled().await {
             Ok(stats) => stats,
@@ -218,7 +308,10 @@ impl WriterManager {
         payload_type: ArrowPayloadType,
         record_batch: &RecordBatch,
         partition_attributes: Option<&[PartitionAttribute]>,
-    ) -> bool {
+    ) -> Result<bool, ParquetError> {
+        if record_batch.num_rows() == 0 {
+            return Ok(false);
+        }
         let path_prefix = format!(
             "{}/{}",
             payload_type.as_str_name().to_lowercase(),
@@ -234,11 +327,14 @@ impl WriterManager {
                 created = true;
                 e.insert(FileWriter::new(
                     payload_type,
-                    new_parquet_arrow_writer(
-                        self.object_store.clone(),
-                        record_batch.schema(),
-                        full_path,
-                    ),
+                    match &self.backend {
+                        Some(backend) => backend.create(&full_path, record_batch.schema())?,
+                        None => Box::new(new_parquet_arrow_writer(
+                            self.object_store.clone(),
+                            record_batch.schema(),
+                            full_path,
+                        )),
+                    },
                 ))
             }
         };
@@ -250,8 +346,11 @@ impl WriterManager {
             self.unflushed_batches_state
                 .incr_unflushed_write(batch_id, payload_type);
         }
+        if created && self.is_pipelined() {
+            *self.files_by_type.entry(payload_type).or_default() += 1;
+        }
 
-        created
+        Ok(created)
     }
 
     fn schedule_flushes(&mut self) -> FlushScheduleStats {
@@ -296,13 +395,13 @@ impl WriterManager {
     }
 
     fn should_flush(&self, file_writer: &FileWriter) -> bool {
-        if let Some(target_rows_per_file) = self.options.target_rows_per_file {
-            file_writer.rows_written >= target_rows_per_file
-        } else if let Some(flush_when_older_than) = self.options.flush_when_older_than {
-            file_writer.created_at.elapsed() > flush_when_older_than
-        } else {
-            false // If no target rows per file is set, don't flush automatically
-        }
+        self.options
+            .target_rows_per_file
+            .is_some_and(|target| file_writer.rows_written >= target)
+            || self
+                .options
+                .flush_when_older_than
+                .is_some_and(|age| file_writer.created_at.elapsed() > age)
     }
 
     /// This method attempts to flush all the scheduled writers. It tries to flush child
@@ -317,6 +416,22 @@ impl WriterManager {
     /// To force everything to flush, you can call `flush_all` method, which will schedule
     /// all the current writers for flushing and then flush them all.
     async fn attempt_flush_scheduled(&mut self) -> Result<FlushAttemptStats, WriteError> {
+        if self.close_failed {
+            return Err(WriteError::from_flush_stats(
+                FlushAttemptStats::default(),
+                ParquetError::General(
+                    "previous file close failed; writer must be abandoned".into(),
+                ),
+            ));
+        }
+        if self.is_pipelined() {
+            let attempts = self.start_staging();
+            self.start_publications(false);
+            return Ok(FlushAttemptStats {
+                flush_attempts: attempts,
+                ..Default::default()
+            });
+        }
         let mut flushable = Vec::new();
         let mut requeue = Vec::new();
         let mut stats = FlushAttemptStats::default();
@@ -338,24 +453,22 @@ impl WriterManager {
                 break;
             }
 
-            for file_writer in &flushable {
-                self.unflushed_batches_state.decr_unflushed_write(
-                    file_writer.batch_ids.iter().copied(),
-                    file_writer.payload_type,
-                );
-            }
-
             stats.flush_attempts += flushable.len() as u64;
             // Drain all in-flight closes so per-file success/failure metrics are complete.
             let mut closes = flushable
                 .drain(..)
-                .map(|fw| fw.writer.close())
+                .map(|fw| async move {
+                    let result = fw.writer.close().await;
+                    (result, fw.batch_ids, fw.payload_type)
+                })
                 .collect::<FuturesUnordered<_>>();
             let mut first_error = None;
 
-            while let Some(result) = closes.next().await {
+            while let Some((result, batch_ids, payload_type)) = closes.next().await {
                 match result {
                     Ok(_) => {
+                        self.unflushed_batches_state
+                            .decr_unflushed_write(batch_ids.into_iter(), payload_type);
                         stats.files_closed += 1;
                         stats.flush_successes += 1;
                     }
@@ -369,6 +482,7 @@ impl WriterManager {
             }
 
             if let Some(error) = first_error {
+                self.close_failed = true;
                 return Err(WriteError::from_flush_stats(stats, error));
             }
         }
@@ -379,8 +493,52 @@ impl WriterManager {
     /// This method flushes all the current writers, ensuring that all files are closed and
     /// all data is written to the object store
     pub async fn flush_all(&mut self) -> Result<WriteStats, WriteError> {
-        for (_, writer) in self.curr_writer_for_prefix.drain() {
-            self.pending_file_flushes.push(writer);
+        if self.close_failed {
+            return Err(WriteError::from_flush_stats(
+                FlushAttemptStats::default(),
+                ParquetError::General(
+                    "previous file completion failed; writer must be abandoned".into(),
+                ),
+            ));
+        }
+        self.schedule_all();
+        if self.is_pipelined() {
+            if let Some(backend) = &self.backend {
+                backend.start_draining().map_err(|error| WriteError {
+                    stats: WriteStats::default(),
+                    error,
+                })?;
+            }
+            let mut stats = WriteStats {
+                flush_attempts: self.start_staging(),
+                ..Default::default()
+            };
+            loop {
+                self.start_publications(true);
+                if self.in_flight.is_empty() {
+                    if !self.pending_file_flushes.is_empty() {
+                        return Err(WriteError {
+                            stats,
+                            error: ParquetError::General(
+                                "file dependency drain made no progress".into(),
+                            ),
+                        });
+                    }
+                    return Ok(stats);
+                }
+                match self.progress().await {
+                    Ok(completed) => {
+                        stats.files_closed += completed.files_closed;
+                        stats.flush_successes += completed.flush_successes;
+                    }
+                    Err(mut error) => {
+                        error.stats.files_closed += stats.files_closed;
+                        error.stats.flush_successes += stats.flush_successes;
+                        error.stats.flush_attempts += stats.flush_attempts;
+                        return Err(error);
+                    }
+                }
+            }
         }
         let attempt_stats = self.attempt_flush_scheduled().await?;
         Ok(WriteStats {
@@ -416,6 +574,129 @@ impl WriterManager {
             flush_successes: attempt_stats.flush_successes,
             flush_failures: attempt_stats.flush_failures,
         })
+    }
+
+    fn is_pipelined(&self) -> bool {
+        self.backend
+            .as_ref()
+            .is_some_and(|backend| backend.max_pending_files().is_some())
+    }
+
+    /// Gate only pdata admission; the exporter must keep polling completion and control.
+    pub fn is_backpressured(&self) -> bool {
+        self.backend
+            .as_ref()
+            .and_then(|backend| backend.max_pending_files())
+            .is_some_and(|limit| self.files_by_type.values().any(|count| *count >= limit))
+    }
+
+    fn schedule_all(&mut self) {
+        self.pending_file_flushes.extend(
+            self.curr_writer_for_prefix
+                .drain()
+                .map(|(_, writer)| writer),
+        );
+    }
+
+    fn start_staging(&mut self) -> u64 {
+        let mut staged = Vec::new();
+        let mut attempts = 0;
+        for mut file in self.pending_file_flushes.drain(..) {
+            if file.staged {
+                staged.push(file);
+            } else {
+                attempts += 1;
+                self.in_flight.push(
+                    async move {
+                        let result = file.writer.stage().await;
+                        file.staged = true;
+                        FlushEvent::Staged(file, result)
+                    }
+                    .boxed_local(),
+                );
+            }
+        }
+        self.pending_file_flushes = staged;
+        attempts
+    }
+
+    fn start_publications(&mut self, force: bool) {
+        let mut blocked = Vec::new();
+        for file in self.pending_file_flushes.drain(..) {
+            if !file.staged
+                || self
+                    .unflushed_batches_state
+                    .has_unflushed_child(file.batch_ids.iter().copied(), file.payload_type)
+            {
+                blocked.push(file);
+            } else {
+                self.in_flight.push(
+                    async move {
+                        let result = if force {
+                            file.writer.close_forced().await
+                        } else {
+                            file.writer.close().await
+                        };
+                        FlushEvent::Closed {
+                            batch_ids: file.batch_ids,
+                            payload_type: file.payload_type,
+                            result,
+                        }
+                    }
+                    .boxed_local(),
+                );
+            }
+        }
+        self.pending_file_flushes = blocked;
+    }
+
+    /// Poll a local finalization/publication future. Remains pending when there is no work.
+    pub async fn progress(&mut self) -> Result<WriteStats, WriteError> {
+        if self.close_failed {
+            return Err(WriteError::from_flush_stats(
+                FlushAttemptStats::default(),
+                ParquetError::General(
+                    "previous file completion failed; writer must be abandoned".into(),
+                ),
+            ));
+        }
+        if self.in_flight.is_empty() {
+            return std::future::pending().await;
+        }
+        let event = self.in_flight.next().await;
+        let mut stats = WriteStats::default();
+        let result = match event {
+            Some(FlushEvent::Staged(file, result)) => {
+                if result.is_ok() {
+                    self.pending_file_flushes.push(file);
+                }
+                result
+            }
+            Some(FlushEvent::Closed {
+                batch_ids,
+                payload_type,
+                result,
+            }) => {
+                if result.is_ok() {
+                    self.unflushed_batches_state
+                        .decr_unflushed_write(batch_ids.into_iter(), payload_type);
+                    if let Some(count) = self.files_by_type.get_mut(&payload_type) {
+                        *count -= 1;
+                    }
+                    stats.files_closed = 1;
+                    stats.flush_successes = 1;
+                }
+                result
+            }
+            None => Ok(()),
+        };
+        if let Err(error) = result {
+            self.close_failed = true;
+            stats.flush_failures = 1;
+            return Err(WriteError { stats, error });
+        }
+        self.start_publications(false);
+        Ok(stats)
     }
 }
 
@@ -458,13 +739,14 @@ struct FileWriter {
     created_at: Instant,
     batch_ids: BTreeSet<i64>,
     payload_type: ArrowPayloadType,
-    writer: AsyncArrowWriter<ParquetObjectWriter>,
+    writer: Box<dyn FileSink>,
     rows_written: usize,
     scheduled_batches: Vec<RecordBatch>,
+    staged: bool,
 }
 
 impl FileWriter {
-    fn new(payload_type: ArrowPayloadType, writer: AsyncArrowWriter<ParquetObjectWriter>) -> Self {
+    fn new(payload_type: ArrowPayloadType, writer: Box<dyn FileSink>) -> Self {
         Self {
             created_at: Instant::now(),
             batch_ids: BTreeSet::new(),
@@ -472,6 +754,7 @@ impl FileWriter {
             writer,
             rows_written: 0,
             scheduled_batches: Vec::new(),
+            staged: false,
         }
     }
 
@@ -584,6 +867,311 @@ mod test {
     };
     use crate::exporters::parquet_exporter::partition::PartitionAttributeValue;
     use crate::exporters::parquet_exporter::records::OtapParquetRecords;
+
+    struct RecordingFactory {
+        closed: Arc<std::sync::Mutex<Vec<String>>>,
+        fail_children: bool,
+    }
+
+    struct RecordingSink {
+        name: String,
+        closed: Arc<std::sync::Mutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl FileSink for RecordingSink {
+        async fn write(&mut self, _batch: &RecordBatch) -> Result<(), ParquetError> {
+            Ok(())
+        }
+
+        async fn close(self: Box<Self>) -> Result<(), ParquetError> {
+            if self.fail {
+                return Err(ParquetError::General(
+                    "injected child commit failure".into(),
+                ));
+            }
+            self.closed
+                .lock()
+                .map_err(|_| ParquetError::General("test lock poisoned".into()))?
+                .push(self.name.clone());
+            Ok(())
+        }
+    }
+
+    impl FileSinkFactory for RecordingFactory {
+        fn create(
+            &self,
+            path: &str,
+            _schema: SchemaRef,
+        ) -> Result<Box<dyn FileSink>, ParquetError> {
+            Ok(Box::new(RecordingSink {
+                name: path.to_string(),
+                closed: Arc::clone(&self.closed),
+                fail: self.fail_children && path.starts_with("log_attrs/"),
+            }))
+        }
+    }
+
+    fn backend_records() -> OtapParquetRecords {
+        use arrow::array::UInt32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::UInt32, false)])),
+            vec![Arc::new(UInt32Array::from(vec![1]))],
+        )
+        .unwrap();
+        let mut store = otel_arrow_dfe_pdata::otap::raw_batch_store::RawLogsStore::new();
+        store.set(ArrowPayloadType::Logs, batch.clone());
+        store.set(ArrowPayloadType::LogAttrs, batch);
+        OtapParquetRecords::Logs(store)
+    }
+
+    struct PipelineFactory {
+        staged: Arc<std::sync::Mutex<Vec<String>>>,
+        closed: Arc<std::sync::Mutex<Vec<String>>>,
+        gates: Arc<tokio::sync::Semaphore>,
+        draining: Arc<std::sync::atomic::AtomicBool>,
+        fail_children: bool,
+    }
+
+    struct PipelineSink {
+        name: String,
+        staged: Arc<std::sync::Mutex<Vec<String>>>,
+        closed: Arc<std::sync::Mutex<Vec<String>>>,
+        gates: Arc<tokio::sync::Semaphore>,
+        draining: Arc<std::sync::atomic::AtomicBool>,
+        fail: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl FileSink for PipelineSink {
+        async fn write(&mut self, _batch: &RecordBatch) -> Result<(), ParquetError> {
+            Ok(())
+        }
+
+        async fn stage(&mut self) -> Result<(), ParquetError> {
+            self.staged.lock().unwrap().push(self.name.clone());
+            Ok(())
+        }
+
+        async fn close(self: Box<Self>) -> Result<(), ParquetError> {
+            if self.name.starts_with("log_attrs/") {
+                if !self.draining.load(std::sync::atomic::Ordering::Acquire) {
+                    self.gates.acquire().await.unwrap().forget();
+                }
+                if self.fail {
+                    return Err(ParquetError::General("injected publication failure".into()));
+                }
+            }
+            self.closed.lock().unwrap().push(self.name.clone());
+            Ok(())
+        }
+    }
+
+    impl FileSinkFactory for PipelineFactory {
+        fn create(
+            &self,
+            path: &str,
+            _schema: SchemaRef,
+        ) -> Result<Box<dyn FileSink>, ParquetError> {
+            Ok(Box::new(PipelineSink {
+                name: path.to_string(),
+                staged: Arc::clone(&self.staged),
+                closed: Arc::clone(&self.closed),
+                gates: Arc::clone(&self.gates),
+                draining: Arc::clone(&self.draining),
+                fail: self.fail_children,
+            }))
+        }
+
+        fn max_pending_files(&self) -> Option<usize> {
+            Some(2)
+        }
+
+        fn start_draining(&self) -> Result<(), ParquetError> {
+            self.draining
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.gates.add_permits(2);
+            Ok(())
+        }
+    }
+
+    fn pipeline_factory(fail_children: bool) -> Arc<PipelineFactory> {
+        Arc::new(PipelineFactory {
+            staged: Arc::new(std::sync::Mutex::new(Vec::new())),
+            closed: Arc::new(std::sync::Mutex::new(Vec::new())),
+            gates: Arc::new(tokio::sync::Semaphore::new(0)),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_children,
+        })
+    }
+
+    /// Scenario: child publications stall while another batch arrives on the same core.
+    /// Guarantees: private parent/child finalization is concurrent, ingestion continues up to its bound, and parents wait for publication.
+    #[tokio::test]
+    async fn pipeline_writes_while_commits_wait_and_bounds_pending_files() {
+        let factory = pipeline_factory(false);
+        let mut manager = WriterManager::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            WriterOptions {
+                target_rows_per_file: Some(1),
+                flush_when_older_than: None,
+            },
+        )
+        .with_backend(factory.clone());
+        let records = backend_records();
+        let _ = manager
+            .write(&[WriteBatch::new(0, &records, None)])
+            .await
+            .unwrap();
+        let stats = manager
+            .write(&[WriteBatch::new(1, &records, None)])
+            .await
+            .unwrap();
+        assert_eq!(stats.rows_written, 2);
+        assert!(manager.is_backpressured());
+        for _ in 0..4 {
+            let _ = manager.progress().await.unwrap();
+        }
+        assert_eq!(factory.staged.lock().unwrap().len(), 4);
+        assert!(factory.closed.lock().unwrap().is_empty());
+        factory.gates.add_permits(2);
+        for _ in 0..4 {
+            let _ = manager.progress().await.unwrap();
+        }
+        assert!(!manager.is_backpressured());
+        let closed = factory.closed.lock().unwrap();
+        assert_eq!(closed.len(), 4);
+        assert!(closed[0].starts_with("log_attrs/"));
+    }
+
+    /// Scenario: shutdown begins while all staged files still await a long collection window.
+    /// Guarantees: every dependency wave is forced and completion includes parent publication.
+    #[tokio::test]
+    async fn pipeline_shutdown_forces_all_dependency_waves() {
+        let factory = pipeline_factory(false);
+        let mut manager = WriterManager::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            WriterOptions {
+                target_rows_per_file: Some(1),
+                flush_when_older_than: None,
+            },
+        )
+        .with_backend(factory.clone());
+        let _ = manager
+            .write(&[WriteBatch::new(0, &backend_records(), None)])
+            .await
+            .unwrap();
+        let stats = tokio::time::timeout(std::time::Duration::from_secs(1), manager.flush_all())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.files_closed, 2);
+        let closed = factory.closed.lock().unwrap();
+        assert!(closed[0].starts_with("log_attrs/"));
+        assert!(closed[1].starts_with("logs/"));
+    }
+
+    /// Scenario: an asynchronous child publication fails after private parent finalization.
+    /// Guarantees: failure reaches the exporter and no subsequent parent or successful drain is reported.
+    #[tokio::test]
+    async fn pipeline_child_failure_poisoning_blocks_parents() {
+        let factory = pipeline_factory(true);
+        let mut manager = WriterManager::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            WriterOptions {
+                target_rows_per_file: Some(1),
+                flush_when_older_than: None,
+            },
+        )
+        .with_backend(factory.clone());
+        let _ = manager
+            .write(&[WriteBatch::new(0, &backend_records(), None)])
+            .await
+            .unwrap();
+        assert!(manager.flush_all().await.is_err());
+        assert!(manager.flush_all().await.is_err());
+        assert!(factory.closed.lock().unwrap().is_empty());
+    }
+
+    /// Scenario: a transactional backend publishes child and parent payload files.
+    /// Guarantees: parent completion occurs only after child completion succeeds.
+    #[tokio::test]
+    async fn injected_backend_preserves_visibility_order() {
+        let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = Arc::new(RecordingFactory {
+            closed: Arc::clone(&closed),
+            fail_children: false,
+        });
+        let mut manager = WriterManager::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            WriterOptions {
+                target_rows_per_file: Some(1),
+                flush_when_older_than: None,
+            },
+        )
+        .with_backend(backend);
+        let records = backend_records();
+        let _ = manager
+            .write(&[WriteBatch::new(0, &records, None)])
+            .await
+            .unwrap();
+        let closed = closed.lock().unwrap();
+        assert_eq!(closed.len(), 2);
+        assert!(closed[0].starts_with("log_attrs/"));
+        assert!(closed[1].starts_with("logs/"));
+    }
+
+    /// Scenario: a child's transactional file completion fails.
+    /// Guarantees: the exporter returns an error and does not publish the parent.
+    #[tokio::test]
+    async fn injected_child_failure_blocks_parent() {
+        let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = Arc::new(RecordingFactory {
+            closed: Arc::clone(&closed),
+            fail_children: true,
+        });
+        let mut manager = WriterManager::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            WriterOptions {
+                target_rows_per_file: Some(1),
+                flush_when_older_than: None,
+            },
+        )
+        .with_backend(backend);
+        let records = backend_records();
+        assert!(
+            manager
+                .write(&[WriteBatch::new(0, &records, None)])
+                .await
+                .is_err()
+        );
+        assert!(manager.flush_all().await.is_err());
+        assert!(closed.lock().unwrap().is_empty());
+    }
+
+    /// Scenario: row and age thresholds are configured together for a small file.
+    /// Guarantees: the age threshold still flushes files below the row target.
+    #[test]
+    fn age_threshold_is_independent_of_row_threshold() {
+        let backend = RecordingSink {
+            name: String::new(),
+            closed: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let mut file = FileWriter::new(ArrowPayloadType::Logs, Box::new(backend));
+        file.created_at = Instant::now() - std::time::Duration::from_secs(10);
+        file.rows_written = 1;
+        let manager = WriterManager::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            WriterOptions {
+                target_rows_per_file: Some(1_000),
+                flush_when_older_than: Some(std::time::Duration::from_secs(2)),
+            },
+        );
+        assert!(manager.should_flush(&file));
+    }
 
     fn to_logs_record_batch(mut bar: BatchArrowRecords) -> OtapParquetRecords {
         let mut consumer = Consumer::default();
