@@ -1,12 +1,15 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Durable buffer for crash-resilient buffering of OTAP data.
+//! Durable buffer for crash-resilient buffering of pipeline data.
 //!
 //! This processor provides durable buffering by writing incoming
 //! telemetry data to a write-ahead log and segment storage before forwarding
 //! downstream. On acknowledgement from downstream, the data is marked as
 //! consumed; on rejection, data can be replayed.
+//!
+//! OTAP Arrow records, OTLP bytes, and pluggable Arrow record sets are all
+//! persisted and replayed without changing their representation.
 //!
 //! # Architecture
 //!
@@ -103,11 +106,10 @@ use otel_arrow_dfe_otap::OTAP_PROCESSOR_FACTORIES;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::TryIntoWithOptions;
 
-pub use bundle_adapter::{BundleConversionError, QuiverRepresentationCapability};
+pub use bundle_adapter::{BundleConversionError, MAX_PLUGGABLE_TABLES, QuiverPersistenceLimit};
 use bundle_adapter::{
-    OtapRecordBundleAdapter, OtlpBytesAdapter, convert_bundle_to_pdata,
-    ensure_quiver_payload_supported, recover_byte_count, recover_item_count,
-    signal_type_from_slot_id,
+    OtapRecordBundleAdapter, OtlpBytesAdapter, PdataArrowBundleAdapter, convert_bundle_to_pdata,
+    recover_byte_count, recover_item_count, signal_type_from_slot_id,
 };
 pub use config::{DurableBufferConfig, OtlpHandling, SizeCapPolicy};
 use deferred_retry_state::DeferredRetryState;
@@ -464,6 +466,7 @@ impl DurableBuffer {
             poll_interval: _,   // DurableBuffer timer, not engine config
             otlp_handling: _,   // DurableBuffer adapter concern
             max_segment_open_duration,
+            wal_flush_interval,
             initial_retry_interval: _, // DurableBuffer retry logic
             max_retry_interval: _,     // DurableBuffer retry logic
             retry_multiplier: _,       // DurableBuffer retry logic
@@ -473,6 +476,7 @@ impl DurableBuffer {
         let mut quiver_config = QuiverConfig::default();
         quiver_config.segment.max_open_duration = *max_segment_open_duration;
         quiver_config.retention.max_age = *max_age;
+        quiver_config.wal.flush_interval = *wal_flush_interval;
         quiver_config
     }
 
@@ -1096,24 +1100,37 @@ impl DurableBuffer {
                 (result, num_items)
             }
             PayloadData::PdataArrowRecords(records) => {
-                let original_payload = OtapPayload::from(records);
-                let error = ensure_quiver_payload_supported(original_payload.data())
-                    .expect_err("pluggable Arrow persistence must remain fail-closed");
-                self.metrics
-                    .ingest_for(IngestFailure::Error)
-                    .failures
-                    .add(1);
-                otel_error!(
-                    "durable_buffer.representation.unsupported",
-                    error = %error
-                );
-                effect_handler
-                    .notify_nack(NackMsg::new_permanent(
-                        error.to_string(),
-                        OtapPdata::new(context, original_payload),
-                    ))
-                    .await?;
-                return Ok(());
+                // Pluggable Arrow: persist every table plus the representation
+                // manifest so the exact record set can be rebuilt on replay.
+                let num_items = records.num_items() as u64;
+                match PdataArrowBundleAdapter::new(records) {
+                    Ok(adapter) => {
+                        let result = match engine.ingest(&adapter).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => Err((e, OtapPayload::from(adapter.into_inner()))),
+                        };
+                        (result, num_items)
+                    }
+                    Err((error, records)) => {
+                        // The record set exceeds what Quiver can persist; retrying
+                        // the same payload can never succeed.
+                        self.metrics
+                            .ingest_for(IngestFailure::Error)
+                            .failures
+                            .add(1);
+                        otel_error!(
+                            "durable_buffer.representation.unsupported",
+                            error = %error
+                        );
+                        effect_handler
+                            .notify_nack(NackMsg::new_permanent(
+                                error.to_string(),
+                                OtapPdata::new(context, OtapPayload::from(records)),
+                            ))
+                            .await?;
+                        return Ok(());
+                    }
+                }
             }
         };
 
@@ -1906,7 +1923,10 @@ pub static DURABLE_BUFFER_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFactor
     name: DURABLE_BUFFER_URN,
     create: create_durable_buffer,
     context_declarations: None,
-    wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
+    // Persists and replays every pdata representation unchanged, including
+    // pluggable Arrow record sets.
+    wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED
+        .with_pdata(otel_arrow_dfe_engine::wiring_contract::PdataWiringContract::PASSTHROUGH),
     validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<DurableBufferConfig>,
 };
 
@@ -1990,6 +2010,7 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+            wal_flush_interval: Duration::from_millis(25),
         };
 
         let processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -2022,6 +2043,27 @@ mod tests {
             item_count,
             byte_count,
         }
+    }
+
+    /// Scenario: The engine validates a pipeline that routes pluggable Arrow pdata
+    /// through the durable buffer.
+    /// Guarantees: The factory accepts every representation family and preserves
+    /// it, so pluggable receiver -> durable buffer -> pluggable exporter wiring
+    /// validates instead of failing with an incompatible-wiring error.
+    #[test]
+    fn factory_declares_passthrough_wiring_contract() {
+        use otel_arrow_dfe_engine::wiring_contract::PdataRepresentationSet;
+
+        let contract = DURABLE_BUFFER_FACTORY.wiring_contract.pdata;
+        assert_eq!(contract.accepted_inputs(), PdataRepresentationSet::ALL);
+        assert_eq!(
+            contract.outputs_for(PdataRepresentationSet::PLUGGABLE_ARROW),
+            PdataRepresentationSet::PLUGGABLE_ARROW
+        );
+        assert_eq!(
+            contract.outputs_for(PdataRepresentationSet::STANDARD),
+            PdataRepresentationSet::STANDARD
+        );
     }
 
     #[test]
@@ -2457,6 +2499,7 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+            wal_flush_interval: Duration::from_millis(25),
         };
 
         let processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -2506,6 +2549,7 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+            wal_flush_interval: Duration::from_millis(25),
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -2566,6 +2610,7 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+            wal_flush_interval: Duration::from_millis(25),
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -2725,6 +2770,7 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+            wal_flush_interval: Duration::from_millis(25),
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
