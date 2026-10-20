@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use arrow_array::types::UInt32Type;
+use bytes::Bytes;
 
 use crate::record_bundle::{ArrowPrimitive, SchemaFingerprint, SlotId};
 
@@ -22,8 +23,19 @@ use super::error::SegmentError;
 /// Magic bytes identifying a Quiver segment file.
 pub(super) const SEGMENT_MAGIC: &[u8; 8] = b"QUIVER\0S";
 
-/// Current segment file format version.
+/// Base segment file format version.
+///
+/// Segments whose bundles carry no metadata are written with this version so
+/// that readers which predate bundle metadata can still read them.
 pub(super) const SEGMENT_VERSION: u16 = 1;
+
+/// Segment format version whose batch manifest may contain a
+/// `bundle_metadata` column.
+///
+/// The footer layout is identical to [`SEGMENT_VERSION`]. The version is
+/// bumped only when a segment actually stores bundle metadata, so older readers
+/// reject such segments instead of silently dropping the metadata.
+pub(super) const SEGMENT_VERSION_BUNDLE_METADATA: u16 = 2;
 
 /// Size of the fixed trailer at the end of the segment file.
 /// Layout: footer_size (4) + magic (8) + crc32 (4) = 16 bytes
@@ -310,6 +322,8 @@ pub struct ManifestEntry {
     /// This excludes segment encoding and shared file overhead. `None` means
     /// the count is unknown.
     byte_count: Option<u64>,
+    /// Opaque adapter metadata persisted with the bundle, if any.
+    metadata: Option<Bytes>,
     /// Mapping from slot to the stream/chunk containing that slot's data.
     slot_refs: HashMap<SlotId, SlotChunkRef>,
 }
@@ -336,8 +350,27 @@ impl ManifestEntry {
             bundle_index,
             item_count,
             byte_count,
+            metadata: None,
             slot_refs: HashMap::new(),
         }
+    }
+
+    /// Attaches opaque bundle metadata to this manifest entry.
+    #[must_use]
+    pub(crate) fn with_metadata(mut self, metadata: Option<Bytes>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Returns the opaque bundle metadata persisted with this bundle, if any.
+    #[must_use]
+    pub fn metadata(&self) -> Option<&[u8]> {
+        self.metadata.as_deref()
+    }
+
+    /// Returns a cheap clone of the persisted bundle metadata, if any.
+    pub(crate) fn metadata_bytes(&self) -> Option<Bytes> {
+        self.metadata.clone()
     }
 
     /// Returns the number of logical data items in this bundle.
@@ -462,7 +495,7 @@ impl std::fmt::Display for SegmentSeq {
 // Footer
 // -----------------------------------------------------------------------------
 
-/// Segment file footer structure (version 1).
+/// Segment file footer structure (versions 1 and 2 share this layout).
 ///
 /// The footer contains metadata needed to locate and interpret the segment's
 /// stream directory and batch manifest. Future versions may add additional
@@ -515,7 +548,7 @@ impl Footer {
         buf
     }
 
-    /// Decodes a version 1 footer from bytes.
+    /// Decodes a version 1 or version 2 footer from bytes.
     ///
     /// # Errors
     ///
@@ -528,7 +561,7 @@ impl Footer {
         }
 
         let version = u16::from_le_bytes([buf[0], buf[1]]);
-        if version != SEGMENT_VERSION {
+        if version != SEGMENT_VERSION && version != SEGMENT_VERSION_BUNDLE_METADATA {
             return Err(SegmentError::InvalidFormat {
                 message: format!("unsupported segment version: {}", version),
             });

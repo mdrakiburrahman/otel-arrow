@@ -17,7 +17,8 @@ use crc32fast::Hasher;
 use tempfile::tempdir;
 
 use crate::record_bundle::{
-    BundleDescriptor, PayloadRef, RecordBundle, SchemaFingerprint, SlotDescriptor, SlotId,
+    BundleDescriptor, MAX_BUNDLE_METADATA_BYTES, PayloadRef, RecordBundle, SchemaFingerprint,
+    SlotDescriptor, SlotId,
 };
 
 use super::cursor_sidecar::{CURSOR_SIDECAR_FILENAME, CursorSidecar};
@@ -26,8 +27,8 @@ use super::reader::test_support::{self, ReadFailure};
 use super::writer::FlushPolicy;
 use super::writer::test_support as writer_test_support;
 use super::{
-    ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, SCHEMA_FINGERPRINT_LEN, WalConsumerCursor,
-    WalError, WalReader, WalWriter, WalWriterOptions,
+    ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA,
+    SCHEMA_FINGERPRINT_LEN, WalConsumerCursor, WalError, WalReader, WalWriter, WalWriterOptions,
 };
 
 /// Helper to get the header size for a test WAL file.
@@ -71,6 +72,7 @@ struct FixtureBundle {
     descriptor: BundleDescriptor,
     ingestion_time: SystemTime,
     slots: Vec<FixtureSlot>,
+    metadata: Option<Vec<u8>>,
 }
 
 impl FixtureBundle {
@@ -79,11 +81,17 @@ impl FixtureBundle {
             descriptor,
             ingestion_time: UNIX_EPOCH + Duration::from_secs(42),
             slots,
+            metadata: None,
         }
     }
 
     fn with_ingestion_time(mut self, ts: SystemTime) -> Self {
         self.ingestion_time = ts;
+        self
+    }
+
+    fn with_metadata(mut self, metadata: Vec<u8>) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 }
@@ -111,6 +119,10 @@ impl RecordBundle for FixtureBundle {
         self.slots
             .first()
             .map_or(0, |slot| slot.batch.num_rows() as u64)
+    }
+
+    fn metadata(&self) -> Option<&[u8]> {
+        self.metadata.as_deref()
     }
 }
 
@@ -413,6 +425,113 @@ async fn wal_writer_reader_roundtrip_recovers_payloads() {
         .map(|value| value.expect("non-null"))
         .collect();
     assert_eq!(collected2, vec![99]);
+}
+
+/// Scenario: A bundle with opaque metadata is appended next to a legacy bundle
+/// without metadata, then the WAL is read back.
+/// Guarantees: The metadata bytes round-trip exactly with their slot payloads,
+/// and bundles without metadata still decode with no metadata attached.
+#[tokio::test]
+async fn wal_writer_reader_roundtrip_preserves_bundle_metadata() {
+    let (_dir, wal_path) = temp_wal("metadata_roundtrip.wal");
+    let descriptor = logs_descriptor();
+    let with_metadata =
+        single_slot_bundle(&descriptor, 0x21, &[5, 6]).with_metadata(b"manifest-v1".to_vec());
+    let without_metadata = single_slot_bundle(&descriptor, 0x22, &[7]);
+
+    let mut writer = open_test_writer(wal_path.clone(), [0x5A; 16]).await;
+    let _ = writer
+        .append_bundle(&with_metadata)
+        .await
+        .expect("append metadata");
+    let _ = writer
+        .append_bundle(&without_metadata)
+        .await
+        .expect("append legacy");
+    drop(writer);
+
+    let entries = read_all_entries(&wal_path);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].metadata.as_deref(), Some(&b"manifest-v1"[..]));
+    assert_eq!(entries[0].slots.len(), 1);
+    assert_eq!(entries[0].slots[0].schema_fingerprint, [0x21; 32]);
+    let values = read_batch(&entries[0].slots[0].payload);
+    assert_eq!(values.num_rows(), 2);
+    assert!(entries[1].metadata.is_none());
+    assert_eq!(entries[1].slots[0].schema_fingerprint, [0x22; 32]);
+}
+
+/// Scenario: A bundle with empty, but present, metadata is appended.
+/// Guarantees: Empty metadata is distinguished from absent metadata after
+/// decoding.
+#[tokio::test]
+async fn wal_writer_reader_distinguishes_empty_metadata() {
+    let (_dir, wal_path) = temp_wal("empty_metadata.wal");
+    let bundle = single_slot_bundle(&logs_descriptor(), 0x23, &[1]).with_metadata(Vec::new());
+
+    let mut writer = open_test_writer(wal_path.clone(), [0x5B; 16]).await;
+    let _ = writer.append_bundle(&bundle).await.expect("append");
+    drop(writer);
+
+    let entries = read_all_entries(&wal_path);
+    assert_eq!(entries[0].metadata.as_deref(), Some(&[][..]));
+}
+
+/// Scenario: A bundle reports metadata one byte larger than the supported maximum.
+/// Guarantees: The writer rejects it before writing any bytes, so the WAL never
+/// holds an entry that readers would treat as corrupt.
+#[tokio::test]
+async fn wal_writer_rejects_oversized_bundle_metadata() {
+    let (_dir, wal_path) = temp_wal("oversized_metadata.wal");
+    let oversized = vec![0x42; MAX_BUNDLE_METADATA_BYTES + 1];
+    let bundle = single_slot_bundle(&logs_descriptor(), 0x24, &[1]).with_metadata(oversized);
+
+    let mut writer = open_test_writer(wal_path.clone(), [0x5C; 16]).await;
+    match writer.append_bundle(&bundle).await {
+        Err(WalError::MetadataTooLarge(len)) => assert_eq!(len, MAX_BUNDLE_METADATA_BYTES + 1),
+        other => panic!("expected metadata too large, got {other:?}"),
+    }
+    drop(writer);
+
+    assert!(read_all_entries(&wal_path).is_empty());
+}
+
+/// Scenario: A crafted metadata entry declares a length above the supported maximum.
+/// Guarantees: The reader rejects the entry as invalid instead of allocating
+/// the declared length.
+#[tokio::test]
+async fn wal_reader_rejects_oversized_bundle_metadata() {
+    let mut body = encode_entry_header(ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA, 0);
+    let declared = u32::try_from(MAX_BUNDLE_METADATA_BYTES + 1).expect("fits u32");
+    body.extend_from_slice(&declared.to_le_bytes());
+    let (_dir, wal_path) = write_single_entry(&body);
+
+    let mut reader = WalReader::open(&wal_path).expect("reader");
+    let mut iter = reader.iter_from(0).expect("iterator");
+    match iter.next() {
+        Some(Err(WalError::InvalidEntry(message))) => {
+            assert_eq!(message, "metadata exceeds supported maximum")
+        }
+        other => panic!("expected oversized metadata error, got {:?}", other),
+    }
+}
+
+/// Scenario: A metadata entry declares more metadata bytes than the entry contains.
+/// Guarantees: The reader reports a truncated entry rather than reading past
+/// the entry boundary.
+#[tokio::test]
+async fn wal_reader_errors_on_truncated_bundle_metadata() {
+    let mut body = encode_entry_header(ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA, 0);
+    body.extend_from_slice(&10u32.to_le_bytes());
+    body.extend_from_slice(&[1, 2, 3]);
+    let (_dir, wal_path) = write_single_entry(&body);
+
+    let mut reader = WalReader::open(&wal_path).expect("reader");
+    let mut iter = reader.iter_from(0).expect("iterator");
+    match iter.next() {
+        Some(Err(WalError::InvalidEntry(message))) => assert_eq!(message, "bundle metadata"),
+        other => panic!("expected truncated metadata error, got {:?}", other),
+    }
 }
 
 #[tokio::test]
@@ -3060,6 +3179,76 @@ async fn recovery_infers_purged_offset_from_cursor() {
             final_offset.next_offset, new_offset.position
         );
     }
+}
+
+/// Scenario: The cursor purges the oldest rotated WAL files while newer rotated
+/// files still hold unconsumed entries, and then the process restarts without a
+/// clean shutdown (for example after `kill -9`).
+/// Guarantees: The reopened writer derives WAL positions from each file header, so
+/// a replay cursor taken from the multi-file reader is accepted and new appends
+/// continue the stream instead of failing with "safe offset beyond wal tail".
+#[tokio::test]
+async fn reopen_after_partial_purge_keeps_wal_positions() {
+    let (_dir, wal_path) = temp_wal("reopen_partial_purge.wal");
+    let descriptor = logs_descriptor();
+    let options = WalWriterOptions::new(wal_path.clone(), [0xCC; 16], FlushPolicy::Immediate)
+        .with_rotation_target(1)
+        .with_max_rotated_files(10);
+
+    // Phase 1: rotate after every append, then consume only the first two
+    // entries so their rotated files are purged while later ones remain.
+    let mut offsets = Vec::new();
+    {
+        let mut writer = WalWriter::open(options.clone()).await.expect("writer");
+        for i in 0..4i64 {
+            let bundle = single_slot_bundle(&descriptor, i as u8, &[i, i + 1]);
+            offsets.push(writer.append_bundle(&bundle).await.expect("append"));
+        }
+        let cursor = WalConsumerCursor {
+            safe_offset: offsets[1].next_offset,
+            safe_sequence: offsets[1].sequence,
+        };
+        writer
+            .persist_cursor(&cursor)
+            .await
+            .expect("persist cursor");
+    }
+    assert!(
+        !rotated_path_for(&wal_path, 1).exists(),
+        "consumed file purged"
+    );
+    assert!(
+        !rotated_path_for(&wal_path, 2).exists(),
+        "consumed file purged"
+    );
+    assert!(
+        rotated_path_for(&wal_path, 3).exists(),
+        "unconsumed file kept"
+    );
+
+    // Phase 2: reopen as crash recovery does, replay the unconsumed entries,
+    // and acknowledge them.
+    let mut writer = WalWriter::open(options).await.expect("reopen writer");
+    let reader = MultiFileWalReader::open(&wal_path).expect("multi reader");
+    let replayed = reader
+        .iter_from(offsets[1].next_offset)
+        .expect("iter")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("replayed entries");
+    assert_eq!(replayed.len(), 2);
+    let last = replayed.last().expect("last replayed entry");
+    assert_eq!(last.next_offset, offsets[3].next_offset);
+    writer
+        .persist_cursor(&WalConsumerCursor::after(last))
+        .await
+        .expect("replay cursor lies within the reopened WAL");
+
+    let bundle = single_slot_bundle(&descriptor, 0xDD, &[0xDD]);
+    let next = writer
+        .append_bundle(&bundle)
+        .await
+        .expect("append after reopen");
+    assert_eq!(next.position, offsets[3].next_offset);
 }
 
 /// Verifies that multiple rotation-cursor-purge cycles maintain

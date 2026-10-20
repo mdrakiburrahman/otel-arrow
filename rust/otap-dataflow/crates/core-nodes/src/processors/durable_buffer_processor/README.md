@@ -14,6 +14,14 @@ The Durable Buffer provides crash-resilient buffering using a
 write-ahead log (WAL) and segment storage. Data is persisted before forwarding
 downstream, enabling recovery after crashes or network outages.
 
+It persists every pdata representation unchanged: OTAP Arrow records, OTLP
+bytes, and pluggable Arrow record sets (see
+[pluggable Arrow pdata](../../../../../docs/pluggable-arrow-pdata.md)). It
+declares a pass-through wiring contract, so it can sit between a pluggable
+Arrow receiver and a pluggable Arrow exporter. A pluggable record set is
+replayed with its exact representation identity and version, signal, root item
+count, table IDs, schema IDs, schema fingerprints, and Arrow batches.
+
 ## Getting Started
 
 Set a persistent storage path before placing the durable buffer ahead of an
@@ -55,6 +63,11 @@ config:
   # Lower values reduce latency but increase I/O overhead.
   max_segment_open_duration: 1s
 
+  # Maximum time between WAL fsyncs (default: 25ms)
+  # Upstream is ACKed after the WAL append. Set 0s to fsync before every
+  # ACK, so acknowledged data always survives a crash (one fsync per bundle).
+  wal_flush_interval: 25ms
+
   # OTLP handling mode (default: pass_through)
   # - pass_through: Store OTLP as opaque binary, very CPU efficient
   # - convert_to_arrow: Convert to Arrow format, enables querying but higher CPU
@@ -91,6 +104,7 @@ Each processor instance (one per CPU core) has its own isolated storage engine:
 ## Message Flow
 
 1. **Ingest**: Incoming data is written to the WAL, then ACK sent upstream
+   (after an fsync when `wal_flush_interval` is `0s`)
 2. **Segment Finalization**: When segment reaches size/time threshold, it's
    written to disk
 3. **Forward**: Timer tick polls for finalized bundles, sends downstream
@@ -145,6 +159,10 @@ See [telemetry.md](telemetry.md) for maintenance notes and the expanded event in
 - Retention size is divided across assigned pipeline cores.
 - `max_age` is based on segment finalization time, not telemetry timestamps.
 - `convert_to_arrow` mode can increase CPU cost compared with `pass_through`.
+- A pluggable Arrow record set can hold at most 12 tables, and its encoded
+  representation manifest (identity plus table and schema IDs) at most 64 KiB.
+  Larger record sets are permanently NACKed because they can never be
+  persisted.
 
 ## Related Docs
 

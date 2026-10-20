@@ -123,14 +123,14 @@ use crc32fast::Hasher;
 
 use crate::budget::DiskBudget;
 use crate::logging::{otel_debug, otel_error, otel_info, otel_warn};
-use crate::record_bundle::{PayloadRef, RecordBundle, SlotId};
+use crate::record_bundle::{MAX_BUNDLE_METADATA_BYTES, PayloadRef, RecordBundle, SlotId};
 
 use super::cursor_sidecar::CursorSidecar;
 use super::header::{WAL_HEADER_MIN_LEN, WalHeader};
 use super::reader::WalReader;
 use super::{
-    ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, MAX_ROTATION_TARGET_BYTES, WalConsumerCursor,
-    WalError, WalResult,
+    ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA,
+    MAX_ROTATION_TARGET_BYTES, WalConsumerCursor, WalError, WalResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -568,12 +568,27 @@ impl WalWriter {
         let descriptor = bundle.descriptor();
         let ingestion_time = bundle.ingestion_time();
         let ingestion_ts_nanos = system_time_to_nanos(ingestion_time)?;
+        let metadata = bundle.metadata();
+        if let Some(metadata) = metadata
+            && metadata.len() > MAX_BUNDLE_METADATA_BYTES
+        {
+            return Err(WalError::MetadataTooLarge(metadata.len()));
+        }
 
         self.active_file.payload_buffer.clear();
 
         let sequence = self.next_sequence;
 
         let mut slot_bitmap = 0u64;
+
+        // Metadata precedes the slot blocks so readers can decode it before
+        // any payload bytes. Its length was bounded above, so the cast is exact.
+        if let Some(metadata) = metadata {
+            self.active_file
+                .payload_buffer
+                .extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+            self.active_file.payload_buffer.extend_from_slice(metadata);
+        }
 
         // Single pass: validate slots and write directly to payload_buffer.
         // The buffer is reused across calls, so after a few appends it stabilizes
@@ -591,7 +606,11 @@ impl WalWriter {
 
         let mut entry_header = [0u8; ENTRY_HEADER_LEN];
         let mut cursor = 0;
-        entry_header[cursor] = ENTRY_TYPE_RECORD_BUNDLE;
+        entry_header[cursor] = if metadata.is_some() {
+            ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA
+        } else {
+            ENTRY_TYPE_RECORD_BUNDLE
+        };
         cursor += 1;
         entry_header[cursor..cursor + 8].copy_from_slice(&ingestion_ts_nanos.to_le_bytes());
         cursor += 8;
@@ -1021,10 +1040,12 @@ impl WalCoordinator {
     fn restore_cursor_offsets(&mut self, active_len: u64) {
         let active_data = active_len.saturating_sub(self.active_header_size);
 
-        // Get the WAL position at the end of rotated files
-        let rotated_end = self.rotated_files.back().map_or(0, |f| f.wal_position_end);
+        // WAL position at the start of the active file. Positions continue
+        // across purged rotated files, so this is not the sum of the data
+        // bytes still on disk.
+        let rotated_end = self.active_wal_position_start();
 
-        // Total logical bytes currently on disk (rotated + active data)
+        // Highest WAL position currently on disk (end of active data)
         let total_on_disk = rotated_end.saturating_add(active_data);
 
         // Handle cursor position beyond what's on disk
@@ -1295,13 +1316,20 @@ impl WalCoordinator {
 
         for (rotation_id, len) in &discovered {
             let path = rotated_wal_path(&self.options.path, *rotation_id);
-            // Read header to get actual header size for this file
+            // The header records where this file starts in the WAL stream,
+            // which already counts older rotated files that were purged.
+            // Summing only the files still on disk would shift every position
+            // back after a purge and reject replay cursors on restart.
             let mut file = File::open(&path).await?;
-            let header_size = WalHeader::read_header_size(&mut file).await? as u64;
+            let header = WalHeader::read_from(&mut file).await?;
+            let header_size = header.encoded_len();
 
             aggregate = aggregate.saturating_add(*len);
             let data_bytes = len.saturating_sub(header_size);
-            wal_position = wal_position.saturating_add(data_bytes);
+            wal_position = header
+                .wal_position_start
+                .max(wal_position)
+                .saturating_add(data_bytes);
             files.push_back(RotatedWalFile {
                 path,
                 rotation_id: *rotation_id,
