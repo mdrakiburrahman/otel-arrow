@@ -185,11 +185,44 @@ fn validate_engine_config_for_startup(
     Ok(())
 }
 
+/// Installs the selected crypto provider before embedding startup performs TLS I/O.
+///
+/// Subsequent engine startup reuses the same initialization result.
+///
+/// # Errors
+/// Returns a failure if the selected provider conflicts with an installed provider.
+pub fn initialize_crypto_provider() -> Result<(), Box<dyn std::error::Error>> {
+    static INITIALIZED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    INITIALIZED
+        .get_or_init(otel_arrow_dfe_otap::crypto::install_crypto_provider)
+        .clone()
+        .map_err(|error| format!("Failed to install rustls crypto provider: {error}").into())
+}
+
 /// Run the standard collector with all component registrations linked by the caller.
 ///
 /// # Errors
 /// Returns configuration, crypto-provider, and controller startup failures.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    run_with_shutdown(|| {})
+}
+
+/// Runs the engine and shuts down embedding telemetry before process exit.
+///
+/// The callback also runs when startup returns an error.
+///
+/// # Errors
+/// Returns configuration, crypto-provider, and controller startup failures.
+pub fn run_with_shutdown<F: FnOnce()>(shutdown: F) -> Result<(), Box<dyn std::error::Error>> {
+    struct ShutdownGuard<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for ShutdownGuard<F> {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.0.take() {
+                shutdown();
+            }
+        }
+    }
+    let shutdown = ShutdownGuard(Some(shutdown));
     #[cfg(all(not(tarpaulin_include), feature = "dhat-heap"))]
     {
         dhat_start();
@@ -197,8 +230,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Install the rustls crypto provider selected by the crypto-* feature flag.
     // This must happen before any TLS connections (reqwest, tonic, etc.).
-    otel_arrow_dfe_otap::crypto::install_crypto_provider()
-        .map_err(|e| format!("Failed to install rustls crypto provider: {e}"))?;
+    initialize_crypto_provider()?;
 
     let Args {
         config,
@@ -213,6 +245,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("{LICENSE_TEXT}");
         println!("\n--- Third-Party Notices ---\n");
         println!("{THIRD_PARTY_NOTICES}");
+        drop(shutdown);
         std::process::exit(0);
     }
 
@@ -242,6 +275,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if validate_and_exit {
         println!("Configuration '{}' is valid.", resolved.source);
+        drop(shutdown);
         std::process::exit(0);
     }
 
@@ -258,12 +292,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // This process owns the console writers, so it stops them before reporting the
     // final status: the controller only drains, because another run may follow it.
+    drop(shutdown);
     startup::shutdown_console_and_exit(&result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: an embedding collector initializes TLS before engine startup.
+    /// Guarantees: subsequent engine initialization reuses the selected provider.
+    #[test]
+    fn crypto_initialization_can_precede_embedding_startup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        initialize_crypto_provider()?;
+        initialize_crypto_provider()?;
+        Ok(())
+    }
 
     #[test]
     fn parse_core_range_ok() {

@@ -8,9 +8,10 @@
 //! trace events are captured and routed.
 
 use crate::event::{LogEvent, ObservedEventReporter};
-use crate::log_filter::RuntimeLogFilter;
+use crate::log_filter::{RuntimeLogFilter, RuntimeLogFilterLayer};
 use crate::self_tracing::{ConsoleWriter, LogContextFn, LogRecord};
 use otel_arrow_dfe_config::settings::telemetry::logs::LogLevel;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 use tracing::{Dispatch, Event, Subscriber};
 #[cfg(test)]
@@ -18,6 +19,54 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::{Context, Layer as TracingLayer};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+/// Factory for an embedding application's unfiltered tracing instrumentation.
+pub type AuxiliaryLayerFactory = fn() -> Box<dyn TracingLayer<Registry> + Send + Sync>;
+
+static AUXILIARY_LAYER_FACTORY: OnceLock<AuxiliaryLayerFactory> = OnceLock::new();
+type AuxiliaryLayer = Box<dyn TracingLayer<Registry> + Send + Sync>;
+type InstrumentedRegistry = tracing_subscriber::layer::Layered<Option<AuxiliaryLayer>, Registry>;
+struct BootstrapLogging {
+    logs: tracing_subscriber::reload::Handle<Option<StructuredLoggingLayer>, InstrumentedRegistry>,
+    filter: tracing_subscriber::reload::Handle<RuntimeLogFilterLayer, InstrumentedRegistry>,
+}
+static BOOTSTRAP_LOGS: OnceLock<BootstrapLogging> = OnceLock::new();
+
+/// Installs instrumentation on every global and thread-local DFE dispatcher.
+///
+/// Call once before starting the controller. Log levels never filter this layer.
+pub fn install_auxiliary_layer_factory(
+    factory: AuxiliaryLayerFactory,
+) -> Result<(), AuxiliaryLayerFactory> {
+    AUXILIARY_LAYER_FACTORY.set(factory)
+}
+
+/// Installs the real global instrumentation subscriber before embedding startup I/O.
+///
+/// The controller later installs its configured logging layer into this same
+/// subscriber, retaining provider mode, runtime filtering and async log routing.
+pub fn init_global_auxiliary_subscriber() -> Result<(), tracing::dispatcher::SetGlobalDefaultError>
+{
+    let auxiliary = AUXILIARY_LAYER_FACTORY.get().map(|factory| factory());
+    let registry = Registry::default().with(auxiliary);
+    let (logs, logs_handle) =
+        tracing_subscriber::reload::Layer::new(None::<StructuredLoggingLayer>);
+    let (filter, _) = RuntimeLogFilter::new(None);
+    let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter.layer());
+    tracing::dispatcher::set_global_default(Dispatch::new(
+        registry.with(logs.with_filter(filter)),
+    ))?;
+    assert!(
+        BOOTSTRAP_LOGS
+            .set(BootstrapLogging {
+                logs: logs_handle,
+                filter: filter_handle,
+            })
+            .is_ok(),
+        "global bootstrap already initialized"
+    );
+    Ok(())
+}
 
 /// Combined tracing configuration for a thread.
 ///
@@ -66,6 +115,15 @@ impl TracingSetup {
 
     /// Initialize this setup as the global tracing subscriber.
     pub fn try_init_global(&self) -> Result<(), tracing::dispatcher::SetGlobalDefaultError> {
+        if let Some(logs) = BOOTSTRAP_LOGS.get() {
+            logs.logs
+                .reload(self.provider.unfiltered_logging_layer(self.context_fn))
+                .expect("process-global tracing subscriber cannot be dropped");
+            logs.filter
+                .reload(self.log_filter.layer())
+                .expect("process-global tracing subscriber cannot be dropped");
+            return Ok(());
+        }
         self.provider
             .try_init_global(self.context_fn, &self.log_filter)
     }
@@ -114,18 +172,39 @@ impl ProviderSetup {
         filter: &RuntimeLogFilter,
         context_fn: LogContextFn,
     ) -> Dispatch {
+        let auxiliary = AUXILIARY_LAYER_FACTORY.get().map(|factory| factory());
+        if auxiliary.is_none() && matches!(self, ProviderSetup::Noop) {
+            return Dispatch::new(tracing::subscriber::NoSubscriber::new());
+        }
+        let registry = Registry::default().with(auxiliary);
+        Dispatch::new(registry.with(self.logging_layer(filter, context_fn)))
+    }
+
+    fn logging_layer<S>(
+        &self,
+        filter: &RuntimeLogFilter,
+        context_fn: LogContextFn,
+    ) -> Option<Box<dyn TracingLayer<S> + Send + Sync>>
+    where
+        S: Subscriber + for<'a> LookupSpan<'a> + 'static,
+    {
+        self.unfiltered_logging_layer(context_fn)
+            .map(|layer| layer.with_filter(filter.layer()).boxed())
+    }
+
+    fn unfiltered_logging_layer(&self, context_fn: LogContextFn) -> Option<StructuredLoggingLayer> {
         match self {
-            ProviderSetup::Noop => Dispatch::new(tracing::subscriber::NoSubscriber::new()),
+            ProviderSetup::Noop => None,
 
             ProviderSetup::ConsoleDirect => {
                 let layer =
                     StructuredLoggingLayer::new(Some(ConsoleWriter::color()), None, context_fn);
-                Dispatch::new(Registry::default().with(filter.layer()).with(layer))
+                Some(layer)
             }
 
             ProviderSetup::InternalAsync { reporter } => {
                 let layer = StructuredLoggingLayer::new(None, Some(reporter.clone()), context_fn);
-                Dispatch::new(Registry::default().with(filter.layer()).with(layer))
+                Some(layer)
             }
         }
     }
@@ -261,6 +340,44 @@ mod tests {
             level("warn"),
             level("error"),
         ]
+    }
+
+    /// Scenario: Embedded instrumentation starts before DFE logging, then worker dispatches disable logs.
+    /// Guarantees: Configuring global logs and Noop/off worker providers never suppresses instrumentation.
+    #[test]
+    fn auxiliary_instrumentation_survives_noop_and_filtered_thread_dispatches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static EVENTS: AtomicUsize = AtomicUsize::new(0);
+        struct Auxiliary;
+        impl<S: Subscriber> TracingLayer<S> for Auxiliary {
+            fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+                if event.metadata().target() == "arrowcol_auxiliary_regression" {
+                    _ = EVENTS.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        assert!(install_auxiliary_layer_factory(|| Box::new(Auxiliary)).is_ok());
+        init_global_auxiliary_subscriber().expect("early global instrumentation");
+        test_setup(ProviderSetup::ConsoleDirect, level("off"))
+            .try_init_global()
+            .expect("configure existing global logging");
+        tracing::info!(target: "arrowcol_auxiliary_regression", "early global");
+        crate::with_cleared_rust_log(|| {
+            for provider in [ProviderSetup::Noop, ProviderSetup::ConsoleDirect] {
+                let setup = test_setup(provider, level("off"));
+                setup.with_subscriber(|| {
+                    tracing::info!(target: "arrowcol_auxiliary_regression", "local");
+                });
+                std::thread::spawn(move || {
+                    setup.with_subscriber(|| {
+                        tracing::info!(target: "arrowcol_auxiliary_regression", "worker");
+                    });
+                })
+                .join()
+                .unwrap();
+            }
+        });
+        assert_eq!(EVENTS.load(Ordering::SeqCst), 5);
     }
 
     /// Scenario: each supported simple log level is used to construct an environment filter.
