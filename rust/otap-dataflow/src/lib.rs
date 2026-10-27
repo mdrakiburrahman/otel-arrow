@@ -207,6 +207,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_with_shutdown(|| {})
 }
 
+struct ShutdownGuard<F: FnOnce(bool)> {
+    callback: Option<F>,
+    clean: bool,
+}
+
+impl<F: FnOnce(bool)> Drop for ShutdownGuard<F> {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.callback.take() {
+            shutdown(self.clean);
+        }
+    }
+}
+
 /// Runs the engine and shuts down embedding telemetry before process exit.
 ///
 /// The callback also runs when startup returns an error.
@@ -214,15 +227,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// # Errors
 /// Returns configuration, crypto-provider, and controller startup failures.
 pub fn run_with_shutdown<F: FnOnce()>(shutdown: F) -> Result<(), Box<dyn std::error::Error>> {
-    struct ShutdownGuard<F: FnOnce()>(Option<F>);
-    impl<F: FnOnce()> Drop for ShutdownGuard<F> {
-        fn drop(&mut self) {
-            if let Some(shutdown) = self.0.take() {
-                shutdown();
-            }
-        }
-    }
-    let shutdown = ShutdownGuard(Some(shutdown));
+    run_with_shutdown_status(move |_| shutdown())
+}
+
+/// Runs the engine and reports whether shutdown completed cleanly to the callback.
+///
+/// The callback runs once after the controller is dropped, or with `false` when
+/// startup returns an error. Validation-only and license exits report `true`.
+///
+/// # Errors
+/// Returns configuration, crypto-provider, and controller startup failures.
+pub fn run_with_shutdown_status<F: FnOnce(bool)>(
+    shutdown: F,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut shutdown = ShutdownGuard {
+        callback: Some(shutdown),
+        clean: false,
+    };
     #[cfg(all(not(tarpaulin_include), feature = "dhat-heap"))]
     {
         dhat_start();
@@ -245,6 +266,7 @@ pub fn run_with_shutdown<F: FnOnce()>(shutdown: F) -> Result<(), Box<dyn std::er
         println!("{LICENSE_TEXT}");
         println!("\n--- Third-Party Notices ---\n");
         println!("{THIRD_PARTY_NOTICES}");
+        shutdown.clean = true;
         drop(shutdown);
         std::process::exit(0);
     }
@@ -275,6 +297,7 @@ pub fn run_with_shutdown<F: FnOnce()>(shutdown: F) -> Result<(), Box<dyn std::er
 
     if validate_and_exit {
         println!("Configuration '{}' is valid.", resolved.source);
+        shutdown.clean = true;
         drop(shutdown);
         std::process::exit(0);
     }
@@ -283,8 +306,10 @@ pub fn run_with_shutdown<F: FnOnce()>(shutdown: F) -> Result<(), Box<dyn std::er
     // `pretty` console exporter never reaches a stdout that carries records.
     claim_structured_stdout(&engine_cfg);
 
-    let controller = Controller::new(&OTAP_PIPELINE_FACTORY);
-    let result = controller.run_forever_with_options(engine_cfg, run_options);
+    let result = {
+        let controller = Controller::new(&OTAP_PIPELINE_FACTORY);
+        controller.run_forever_with_options(engine_cfg, run_options)
+    };
     #[cfg(all(not(tarpaulin_include), feature = "dhat-heap"))]
     {
         dhat_finish();
@@ -292,6 +317,7 @@ pub fn run_with_shutdown<F: FnOnce()>(shutdown: F) -> Result<(), Box<dyn std::er
 
     // This process owns the console writers, so it stops them before reporting the
     // final status: the controller only drains, because another run may follow it.
+    shutdown.clean = result.is_ok();
     drop(shutdown);
     startup::shutdown_console_and_exit(&result)
 }
@@ -299,6 +325,27 @@ pub fn run_with_shutdown<F: FnOnce()>(shutdown: F) -> Result<(), Box<dyn std::er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: startup may fail or the controller may complete cleanly.
+    /// Guarantees: cleanup runs once and never labels failed startup as clean.
+    #[test]
+    fn shutdown_callback_reports_completion_once() {
+        for clean in [false, true] {
+            let calls = std::cell::Cell::new(0);
+            let observed = std::cell::Cell::new(None);
+            let mut shutdown = ShutdownGuard {
+                callback: Some(|completed| {
+                    calls.set(calls.get() + 1);
+                    observed.set(Some(completed));
+                }),
+                clean: false,
+            };
+            shutdown.clean = clean;
+            drop(shutdown);
+            assert_eq!(calls.get(), 1);
+            assert_eq!(observed.get(), Some(clean));
+        }
+    }
 
     /// Scenario: an embedding collector initializes TLS before engine startup.
     /// Guarantees: subsequent engine initialization reuses the selected provider.
