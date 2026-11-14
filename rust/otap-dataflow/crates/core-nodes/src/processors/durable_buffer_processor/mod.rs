@@ -86,6 +86,7 @@ mod metrics;
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -419,20 +420,21 @@ fn record_effective_wal_config(
         .map(|(_, (_, class))| *class)
         .max_by_key(|class| durability_rank(class))
         .unwrap_or("durable");
-    eprintln!(
-        "arrowcol_wal_effective_config {}",
-        serde_json::json!({ "kind": "instance", "instance": instance })
-    );
-    eprintln!(
-        "arrowcol_wal_effective_config {}",
-        serde_json::json!({
-            "kind": "aggregate",
-            "deployment_generation": generation,
-            "instance_count": instances.len(),
-            "instances": instances,
-            "durability_class": aggregate,
-        })
-    );
+    let instance_record = serde_json::json!({ "kind": "instance", "instance": instance });
+    let aggregate_record = serde_json::json!({
+        "kind": "aggregate",
+        "deployment_generation": generation,
+        "instance_count": instances.len(),
+        "instances": instances,
+        "durability_class": aggregate,
+    });
+    let mut stderr = std::io::stderr().lock();
+    writeln!(stderr, "arrowcol_wal_effective_config {instance_record}")
+        .and_then(|()| writeln!(stderr, "arrowcol_wal_effective_config {aggregate_record}"))
+        .and_then(|()| stderr.flush())
+        .map_err(|error| ConfigError::InvalidUserConfig {
+            error: format!("write WAL effective config: {error}"),
+        })?;
     Ok(())
 }
 
