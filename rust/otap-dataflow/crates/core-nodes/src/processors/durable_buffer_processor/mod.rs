@@ -400,7 +400,14 @@ fn record_effective_wal_config(
         .map_err(|_| ConfigError::InvalidUserConfig {
             error: "WAL effective config registry is poisoned".to_owned(),
         })?;
-    registry.insert((generation, instance_id), (instance.clone(), class));
+    if registry
+        .insert((generation, instance_id), (instance.clone(), class))
+        .is_some()
+    {
+        return Err(ConfigError::InvalidUserConfig {
+            error: "duplicate WAL effective config instance identity".to_owned(),
+        });
+    }
     let instances = registry
         .iter()
         .filter(|((instance_generation, _), _)| *instance_generation == generation)
