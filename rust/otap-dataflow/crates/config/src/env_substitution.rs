@@ -138,6 +138,8 @@ mod tests {
     use super::*;
     use std::env;
 
+    static WAL_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn with_vars<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
         let originals: Vec<_> = vars
             .iter()
@@ -181,6 +183,7 @@ mod tests {
     /// Guarantees: New WAL placeholders retain the existing mount and capacity values.
     #[test]
     fn wal_environment_variables_fall_back_to_legacy_quiver_aliases() {
+        let _guard = WAL_ENV_TEST_LOCK.lock().unwrap();
         with_vars(
             &[
                 ("ARROWCOL_WAL_PATH", None),
@@ -203,6 +206,7 @@ mod tests {
     /// Guarantees: Configuration resolution fails instead of selecting a different mount or capacity silently.
     #[test]
     fn wal_environment_alias_conflicts_fail_explicitly() {
+        let _guard = WAL_ENV_TEST_LOCK.lock().unwrap();
         with_vars(
             &[
                 ("ARROWCOL_WAL_PATH", Some("/data/new")),
