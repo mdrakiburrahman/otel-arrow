@@ -1,0 +1,6 @@
+change_type: enhancement
+component: pipeline
+note: "WAL settings support legacy Quiver environment names and report validated per-instance and aggregate durability."
+issues: []
+subtext: |
+  Conflicting legacy and WAL-prefixed path or capacity values fail startup. Effective readback omits storage paths and reports the weakest configured durability class.

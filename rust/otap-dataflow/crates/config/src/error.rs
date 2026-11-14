@@ -218,6 +218,18 @@ pub enum Error {
         var: String,
     },
 
+    /// A canonical and legacy environment variable were both set to different values.
+    #[error(
+        "Environment variables `{canonical}` and legacy alias `{legacy}` have conflicting values"
+    )]
+    #[diagnostic(code(data_plane::env_var_conflict), url(docsrs))]
+    EnvVarConflict {
+        /// The canonical environment variable.
+        canonical: String,
+        /// The legacy environment variable alias.
+        legacy: String,
+    },
+
     /// An invalid user configuration occurred.
     #[error("An invalid user configuration occurred: {error}")]
     InvalidUserConfig {

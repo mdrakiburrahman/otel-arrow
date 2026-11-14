@@ -106,6 +106,7 @@ impl From<SizeCapPolicy> for RetentionPolicy {
 
 /// Configuration for the durable buffer.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableBufferConfig {
     /// Directory path for persistent storage.
     pub path: PathBuf,
@@ -207,6 +208,44 @@ impl DurableBufferConfig {
     pub fn retention_policy(&self) -> RetentionPolicy {
         self.size_cap_policy.into()
     }
+
+    /// Returns the weakest delivery guarantee implied by this configuration.
+    #[must_use]
+    pub fn durability_class(&self) -> &'static str {
+        if self.max_age.is_some() || self.size_cap_policy == SizeCapPolicy::DropOldest {
+            "lossy_eviction"
+        } else if !self.wal_flush_interval.is_zero() {
+            "fsync_batched"
+        } else {
+            "durable"
+        }
+    }
+
+    /// Validates bounded runtime controls before the processor is constructed.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.poll_interval.is_zero() {
+            return Err("poll_interval must be greater than zero".to_owned());
+        }
+        if self.max_segment_open_duration.is_zero() {
+            return Err("max_segment_open_duration must be greater than zero".to_owned());
+        }
+        if self.initial_retry_interval.is_zero() {
+            return Err("initial_retry_interval must be greater than zero".to_owned());
+        }
+        if self.max_retry_interval < self.initial_retry_interval {
+            return Err("max_retry_interval must be at least initial_retry_interval".to_owned());
+        }
+        if !self.retry_multiplier.is_finite() || !(1.0..=10.0).contains(&self.retry_multiplier) {
+            return Err("retry_multiplier must be finite and between 1.0 and 10.0".to_owned());
+        }
+        if !(1..=1_000_000).contains(&self.max_in_flight) {
+            return Err("max_in_flight must be between 1 and 1000000".to_owned());
+        }
+        if self.size_cap_bytes() == 0 {
+            return Err("retention_size_cap must be greater than zero".to_owned());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -248,6 +287,57 @@ mod tests {
         let json = r#"{"path": "/tmp/test", "size_cap_policy": "backpressure"}"#;
         let config: DurableBufferConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.size_cap_policy, SizeCapPolicy::Backpressure);
+    }
+
+    /// Scenario: A buffer config uses zero flush interval, batched fsync, expiry, or drop-oldest.
+    /// Guarantees: Durability labels preserve loss precedence over weaker fsync cadence.
+    #[test]
+    fn durability_class_labels_fsync_and_lossy_retention() {
+        let mut config: DurableBufferConfig =
+            serde_json::from_str(r#"{"path":"/tmp/test","wal_flush_interval":"0s"}"#).unwrap();
+        assert_eq!(config.durability_class(), "durable");
+        config.wal_flush_interval = Duration::from_millis(25);
+        assert_eq!(config.durability_class(), "fsync_batched");
+        config.wal_flush_interval = Duration::ZERO;
+        config.size_cap_policy = SizeCapPolicy::DropOldest;
+        assert_eq!(config.durability_class(), "lossy_eviction");
+        config.size_cap_policy = SizeCapPolicy::Backpressure;
+        config.max_age = Some(Duration::from_secs(60));
+        assert_eq!(config.durability_class(), "lossy_eviction");
+    }
+
+    /// Scenario: Runtime polling, retry bounds, multiplier, or concurrency is invalid.
+    /// Guarantees: Unsafe or unbounded processor controls fail with a field-specific error.
+    #[test]
+    fn runtime_controls_reject_invalid_bounds() {
+        let mut config: DurableBufferConfig =
+            serde_json::from_str(r#"{"path":"/tmp/test"}"#).unwrap();
+        config.poll_interval = Duration::ZERO;
+        assert!(config.validate().unwrap_err().contains("poll_interval"));
+        config.poll_interval = Duration::from_millis(100);
+        config.max_retry_interval = Duration::from_millis(1);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("max_retry_interval")
+        );
+        config.max_retry_interval = Duration::from_secs(30);
+        config.retry_multiplier = f64::INFINITY;
+        assert!(config.validate().unwrap_err().contains("retry_multiplier"));
+        config.retry_multiplier = 2.0;
+        config.max_in_flight = 0;
+        assert!(config.validate().unwrap_err().contains("max_in_flight"));
+    }
+
+    /// Scenario: A durable config contains a field the processor does not support.
+    /// Guarantees: Unknown values are rejected instead of being silently parsed and ignored.
+    #[test]
+    fn unknown_durable_buffer_fields_are_rejected() {
+        let result = serde_json::from_str::<DurableBufferConfig>(
+            r#"{"path":"/tmp/test","segment_target_size_bytes":1048576}"#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

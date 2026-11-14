@@ -67,24 +67,15 @@ pub fn substitute_env_vars(input: &str) -> Result<String, Error> {
                     None => (spec, None),
                 };
 
-                let value = match std::env::var(var_name) {
-                    Ok(v) => v,
-                    Err(env_var_error) => match default {
-                        Some(d) => d.to_string(),
-                        None => match env_var_error {
-                            std::env::VarError::NotPresent => {
-                                // Variable is simply not set.
-                                return Err(Error::EnvVarNotFound {
-                                    var: var_name.to_string(),
-                                });
-                            }
-                            std::env::VarError::NotUnicode(_) => {
-                                // Variable is set but contains invalid Unicode.
-                                return Err(Error::EnvVarCannotBeParsed {
-                                    var: var_name.to_string(),
-                                });
-                            }
-                        },
+                let value = match resolve_env_var(var_name)? {
+                    Some(value) => value,
+                    None => match default {
+                        Some(default) => default.to_owned(),
+                        None => {
+                            return Err(Error::EnvVarNotFound {
+                                var: var_name.to_owned(),
+                            });
+                        }
                     },
                 };
 
@@ -108,11 +99,68 @@ pub fn substitute_env_vars(input: &str) -> Result<String, Error> {
     Ok(output)
 }
 
+fn resolve_env_var(var_name: &str) -> Result<Option<String>, Error> {
+    let legacy_name = match var_name {
+        "ARROWCOL_WAL_PATH" => Some("ARROWCOL_QUIVER_PATH"),
+        "ARROWCOL_WAL_RETENTION_SIZE_CAP" => Some("ARROWCOL_QUIVER_CAPACITY"),
+        _ => None,
+    };
+    let canonical = read_env_var(var_name)?;
+    let Some(legacy_name) = legacy_name else {
+        return Ok(canonical);
+    };
+    let legacy = read_env_var(legacy_name)?;
+    match (canonical, legacy) {
+        (Some(canonical_value), Some(legacy_value)) if canonical_value != legacy_value => {
+            Err(Error::EnvVarConflict {
+                canonical: var_name.to_owned(),
+                legacy: legacy_name.to_owned(),
+            })
+        }
+        (Some(canonical_value), _) => Ok(Some(canonical_value)),
+        (None, legacy_value) => Ok(legacy_value),
+    }
+}
+
+fn read_env_var(var_name: &str) -> Result<Option<String>, Error> {
+    match std::env::var(var_name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::EnvVarCannotBeParsed {
+            var: var_name.to_owned(),
+        }),
+    }
+}
+
 #[cfg(test)]
 #[allow(unsafe_code)] // set_var / remove_var are unsafe in recent Rust; safe in single-threaded tests.
 mod tests {
     use super::*;
     use std::env;
+
+    fn with_vars<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let originals: Vec<_> = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_owned(), env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            unsafe {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+        f();
+        for (key, value) in originals {
+            unsafe {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
 
     // Helper: run the substitution with a scoped env var set.
     // Uses a unique prefix to avoid test-to-test interference when tests run in
@@ -127,6 +175,47 @@ mod tests {
         unsafe {
             env::remove_var(key);
         }
+    }
+
+    /// Scenario: Only the legacy Quiver path and capacity variables are set.
+    /// Guarantees: New WAL placeholders retain the existing mount and capacity values.
+    #[test]
+    fn wal_environment_variables_fall_back_to_legacy_quiver_aliases() {
+        with_vars(
+            &[
+                ("ARROWCOL_WAL_PATH", None),
+                ("ARROWCOL_QUIVER_PATH", Some("/mnt/quiver")),
+                ("ARROWCOL_WAL_RETENTION_SIZE_CAP", None),
+                ("ARROWCOL_QUIVER_CAPACITY", Some("8 GiB")),
+            ],
+            || {
+                let output = substitute_env_vars(concat!(
+                    "path: ${env:ARROWCOL_WAL_PATH:-/var/lib/arrowcol/quiver}\n",
+                    "capacity: ${env:ARROWCOL_WAL_RETENTION_SIZE_CAP:-4 GiB}"
+                ))
+                .unwrap();
+                assert_eq!(output, "path: /mnt/quiver\ncapacity: 8 GiB");
+            },
+        );
+    }
+
+    /// Scenario: Canonical and legacy WAL variables specify different values.
+    /// Guarantees: Configuration resolution fails instead of selecting a different mount or capacity silently.
+    #[test]
+    fn wal_environment_alias_conflicts_fail_explicitly() {
+        with_vars(
+            &[
+                ("ARROWCOL_WAL_PATH", Some("/data/new")),
+                ("ARROWCOL_QUIVER_PATH", Some("/data/old")),
+            ],
+            || {
+                let error =
+                    substitute_env_vars("path: ${env:ARROWCOL_WAL_PATH:-/var/lib/arrowcol/quiver}")
+                        .unwrap_err();
+                assert!(error.to_string().contains("ARROWCOL_WAL_PATH"));
+                assert!(error.to_string().contains("ARROWCOL_QUIVER_PATH"));
+            },
+        );
     }
 
     #[test]

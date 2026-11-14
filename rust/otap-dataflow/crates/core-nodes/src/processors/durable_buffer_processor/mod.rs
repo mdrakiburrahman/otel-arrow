@@ -85,8 +85,8 @@ mod deferred_retry_state;
 mod metrics;
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -143,6 +143,10 @@ use otel_arrow_dfe_telemetry::common_attributes::SignalAttributes;
 
 /// URN for the durable buffer.
 pub const DURABLE_BUFFER_URN: &str = "urn:otel:processor:durable_buffer";
+
+static EFFECTIVE_CONFIG_READBACK: OnceLock<
+    Mutex<BTreeMap<(u64, String), (serde_json::Value, &'static str)>>,
+> = OnceLock::new();
 
 /// Minimum interval between repeated warning logs for the same condition
 /// (backpressure, flush failures). Prevents log flooding when the timer
@@ -351,6 +355,89 @@ pub struct DurableBuffer {
     last_loss_snapshot: RetentionLossSnapshot,
 }
 
+fn record_effective_wal_config(
+    config: &DurableBufferConfig,
+    pipeline_ctx: &PipelineContext,
+    per_core_size_cap: u64,
+) -> Result<(), ConfigError> {
+    let generation = pipeline_ctx.deployment_generation();
+    let instance_id = format!(
+        "{}:{}:{}:{}",
+        pipeline_ctx.pipeline_group_id(),
+        pipeline_ctx.pipeline_id(),
+        pipeline_ctx.node_id(),
+        pipeline_ctx.core_id()
+    );
+    let class = config.durability_class();
+    let instance = serde_json::json!({
+        "instance_id": instance_id,
+        "deployment_generation": generation,
+        "core_id": pipeline_ctx.core_id(),
+        "num_cores": pipeline_ctx.num_cores(),
+        "wal_flush_interval_ns": config.wal_flush_interval.as_nanos().to_string(),
+        "retention_size_cap_bytes": config.size_cap_bytes(),
+        "per_core_retention_size_cap_bytes": per_core_size_cap,
+        "max_age_ns": config.max_age.map(|duration| duration.as_nanos().to_string()),
+        "size_cap_policy": match config.size_cap_policy {
+            SizeCapPolicy::Backpressure => "backpressure",
+            SizeCapPolicy::DropOldest => "drop_oldest",
+        },
+        "poll_interval_ns": config.poll_interval.as_nanos().to_string(),
+        "otlp_handling": match config.otlp_handling {
+            OtlpHandling::PassThrough => "pass_through",
+            OtlpHandling::ConvertToArrow => "convert_to_arrow",
+        },
+        "max_segment_open_duration_ns": config.max_segment_open_duration.as_nanos().to_string(),
+        "initial_retry_interval_ns": config.initial_retry_interval.as_nanos().to_string(),
+        "max_retry_interval_ns": config.max_retry_interval.as_nanos().to_string(),
+        "retry_multiplier": config.retry_multiplier,
+        "max_in_flight": config.max_in_flight,
+        "durability_class": class,
+    });
+    let registry = EFFECTIVE_CONFIG_READBACK.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut registry = registry
+        .lock()
+        .map_err(|_| ConfigError::InvalidUserConfig {
+            error: "WAL effective config registry is poisoned".to_owned(),
+        })?;
+    registry.insert((generation, instance_id), (instance.clone(), class));
+    let instances = registry
+        .iter()
+        .filter(|((instance_generation, _), _)| *instance_generation == generation)
+        .map(|(_, (instance, _))| instance.clone())
+        .collect::<Vec<_>>();
+    let aggregate = registry
+        .iter()
+        .filter(|((instance_generation, _), _)| *instance_generation == generation)
+        .map(|(_, (_, class))| *class)
+        .max_by_key(|class| durability_rank(class))
+        .unwrap_or("durable");
+    eprintln!(
+        "arrowcol_wal_effective_config {}",
+        serde_json::json!({ "kind": "instance", "instance": instance })
+    );
+    eprintln!(
+        "arrowcol_wal_effective_config {}",
+        serde_json::json!({
+            "kind": "aggregate",
+            "deployment_generation": generation,
+            "instance_count": instances.len(),
+            "instances": instances,
+            "durability_class": aggregate,
+        })
+    );
+    Ok(())
+}
+
+fn durability_rank(class: &str) -> u8 {
+    match class {
+        "durable" => 0,
+        "fsync_batched" => 1,
+        "lossy_eviction" => 2,
+        _ => u8::MAX,
+    }
+}
+
 impl DurableBuffer {
     /// Creates a new durable buffer with the given configuration.
     ///
@@ -363,6 +450,9 @@ impl DurableBuffer {
         config: DurableBufferConfig,
         pipeline_ctx: &PipelineContext,
     ) -> Result<Self, ConfigError> {
+        config
+            .validate()
+            .map_err(|error| ConfigError::InvalidUserConfig { error })?;
         let metrics = DurableBufferMetrics::new(pipeline_ctx);
         let core_id = pipeline_ctx.core_id();
         let num_cores = pipeline_ctx.num_cores();
@@ -399,6 +489,8 @@ impl DurableBuffer {
                 },
             });
         }
+
+        record_effective_wal_config(&config, pipeline_ctx, per_core_size_cap)?;
 
         Ok(Self {
             engine_state: EngineState::Uninitialized,
@@ -1933,6 +2025,27 @@ pub static DURABLE_BUFFER_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFactor
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Scenario: A process has WAL instances with different durability classes.
+    /// Guarantees: The aggregate always reports the weakest effective guarantee.
+    #[test]
+    fn aggregate_durability_class_uses_weakest_instance() {
+        let classes = ["durable", "fsync_batched", "lossy_eviction"];
+        assert_eq!(
+            classes
+                .iter()
+                .copied()
+                .max_by_key(|class| durability_rank(class)),
+            Some("lossy_eviction")
+        );
+        assert_eq!(
+            classes[..2]
+                .iter()
+                .copied()
+                .max_by_key(|class| durability_rank(class)),
+            Some("fsync_batched")
+        );
+    }
+
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
