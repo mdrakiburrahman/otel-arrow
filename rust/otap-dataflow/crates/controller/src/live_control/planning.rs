@@ -562,13 +562,20 @@ impl<
         Ok(profiles)
     }
 
-    fn validate_live_state_dir_unchanged(
+    fn validate_restart_only_engine_settings(
         current_config: &OtelDataflowSpec,
         desired_config: &OtelDataflowSpec,
     ) -> Result<(), ControlPlaneError> {
         if current_config.engine.state_dir != desired_config.engine.state_dir {
             return Err(ControlPlaneError::InvalidRequest {
                 message: "engine.state_dir cannot be added, removed, or changed at runtime; restart the engine to select a different state location".to_owned(),
+            });
+        }
+        if current_config.engine.shutdown_drain_timeout_seconds
+            != desired_config.engine.shutdown_drain_timeout_seconds
+        {
+            return Err(ControlPlaneError::InvalidRequest {
+                message: "engine.shutdown_drain_timeout_seconds cannot be changed at runtime; restart the engine to change the drain timeout".to_owned(),
             });
         }
         Ok(())
@@ -787,7 +794,7 @@ impl<
         let mut candidate_config = planning_config
             .cloned()
             .unwrap_or_else(|| live_config.clone());
-        Self::validate_live_state_dir_unchanged(&live_config, &candidate_config)?;
+        Self::validate_restart_only_engine_settings(&live_config, &candidate_config)?;
         let group_cfg = candidate_config
             .groups
             .get_mut(&pipeline_group_id)
@@ -2130,7 +2137,7 @@ impl<
             &desired_config,
             request.delete_missing,
         );
-        Self::validate_live_state_dir_unchanged(&live_config, &candidate_config)?;
+        Self::validate_restart_only_engine_settings(&live_config, &candidate_config)?;
         candidate_config
             .validate()
             .map_err(|err| ControlPlaneError::InvalidRequest {

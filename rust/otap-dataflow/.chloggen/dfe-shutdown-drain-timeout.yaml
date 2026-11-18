@@ -1,0 +1,4 @@
+change_type: enhancement
+component: pipeline
+note: "Configure the graceful OS-signal drain budget with engine.shutdown_drain_timeout_seconds (default 60 seconds)."
+issues: []

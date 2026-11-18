@@ -344,6 +344,7 @@ Important behavior:
 `engine` is the home for engine-wide settings:
 
 - `state_dir`
+- `shutdown_drain_timeout_seconds`
 - `topics`
 - `http_admin`
 - `telemetry`
@@ -359,6 +360,13 @@ pipelines start on Linux. It has no default and cannot be added, removed, or
 changed during live reconfiguration. Existing journald and scraper checkpoints
 are not automatically migrated. See [Engine state directory](state-directory.md)
 for permission, durability, platform, and consumer-adoption requirements.
+
+### OS Signal Drain Timeout
+
+`engine.shutdown_drain_timeout_seconds` is a positive integer in seconds
+(default `60`). It bounds pipeline drain after the first OS termination signal.
+Changes require an engine restart. Set the process supervisor's stop grace
+longer than this deadline so it does not kill the process during drain.
 
 ### Engine Topic Settings
 

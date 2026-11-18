@@ -44,7 +44,7 @@
 use crate::error::Error;
 use crate::thread_task::{ThreadLocalTaskHandle, spawn_thread_local_task};
 use core_affinity::CoreId;
-use otel_arrow_dfe_admin::ControlPlane;
+use otel_arrow_dfe_admin::{ControlPlane, ControlPlaneError};
 use otel_arrow_dfe_config::engine::{
     OtelDataflowSpec, ResolvedOtelDataflowSpec, ResolvedPipelineConfig, ResolvedPipelineRole,
     SYSTEM_OBSERVABILITY_PIPELINE_ID, SYSTEM_PIPELINE_GROUP_ID,
@@ -1975,7 +1975,14 @@ impl<
             if run_mode == RunMode::ParkMainThread && options.handle_os_signals {
                 // Listen for SIGINT/SIGTERM and trigger graceful shutdown via the
                 // control plane.
-                Some(Self::spawn_shutdown_signal_listener(signal_control_plane)?)
+                Some(Self::spawn_shutdown_signal_listener(
+                    engine_config
+                        .engine
+                        .shutdown_drain_timeout_seconds
+                        .get()
+                        .into(),
+                    move |timeout_secs| signal_control_plane.shutdown_all(timeout_secs),
+                )?)
             } else {
                 None
             };
@@ -2275,7 +2282,8 @@ impl<
     ///
     /// The returned handle cancels and joins the listener during controller teardown.
     fn spawn_shutdown_signal_listener(
-        control_plane: Arc<dyn ControlPlane>,
+        shutdown_drain_timeout_seconds: u64,
+        shutdown_all: impl Fn(u64) -> Result<(), ControlPlaneError> + Send + 'static,
     ) -> Result<ShutdownSignalListenerHandle, Error> {
         // Construct the runtime and register handlers before spawning the waiter.
         // This closes the window in which the thread existed but the process still
@@ -2305,26 +2313,17 @@ impl<
                     otel_info!(
                         "shutdown.signal_received",
                         signal = signal_name,
+                        drain_timeout_secs = shutdown_drain_timeout_seconds,
                         message = "OS termination signal received, initiating graceful shutdown. Send the signal again to force immediate exit."
                     );
 
-                        // Give pipelines a generous deadline to drain (60 s by default).
-                        // Note: this exceeds the default Kubernetes
-                        // terminationGracePeriodSeconds (30 s), so under stock pod
-                        // settings the kubelet's SIGKILL -- not this deadline -- is the
-                        // binding constraint. This value only bounds the drain when the
-                        // supervisor grants at least that much time.
-                        // TODO: make this configurable via engine config.
-                        const SHUTDOWN_TIMEOUT_SECS: u64 = 60;
-
-                        // Retry a few times if the control channel is full under
-                        // backpressure -- avoids silently dropping the shutdown request.
-                        const MAX_RETRIES: u32 = 3;
-                        const RETRY_INTERVAL: Duration = Duration::from_millis(500);
+                    // Retry a few times under control-channel backpressure.
+                    const MAX_RETRIES: u32 = 3;
+                    const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
                     let mut last_err = None;
                     for attempt in 0..MAX_RETRIES {
-                        match control_plane.shutdown_all(SHUTDOWN_TIMEOUT_SECS) {
+                        match shutdown_all(shutdown_drain_timeout_seconds) {
                             Ok(()) => {
                                 otel_info!(
                                     "shutdown.signal_dispatched",
@@ -6422,6 +6421,55 @@ groups:
             }
         }
         assert_eq!(broadcast_messages, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_dispatches_the_configured_drain_timeout() {
+        const CHILD_ENV: &str = "OTAP_DF_SIGTERM_DRAIN_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "tests::sigterm_dispatches_the_configured_drain_timeout",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("SIGTERM test child should start");
+            assert!(
+                output.status.success(),
+                "SIGTERM test child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (sent, received) = std::sync::mpsc::channel();
+        let config: otel_arrow_dfe_config::engine::EngineConfig =
+            serde_json::from_str(r#"{"shutdown_drain_timeout_seconds":240}"#)
+                .expect("engine config");
+        let _listener = Controller::<()>::spawn_shutdown_signal_listener(
+            config.shutdown_drain_timeout_seconds.get().into(),
+            move |seconds| {
+                sent.send(seconds).expect("test captures dispatch");
+                Ok(())
+            },
+        )
+        .expect("signal listener registers synchronously");
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("send SIGTERM to this test child");
+        assert!(status.success());
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("shutdown dispatch"),
+            240,
+        );
     }
 
     /// Scenario: termination-signal streams are registered inside a Tokio runtime in a child process.

@@ -142,10 +142,18 @@ struct ContextPolicyLayer<'a> {
     context: Option<&'a ContextPolicy>,
 }
 
+const fn default_shutdown_drain_timeout_seconds() -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::new(60).expect("60 is nonzero")
+}
+
 /// Top-level engine configuration section.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EngineConfig {
+    /// Graceful pipeline drain budget after the first OS termination signal, in seconds.
+    #[serde(default = "default_shutdown_drain_timeout_seconds")]
+    pub shutdown_drain_timeout_seconds: std::num::NonZeroU32,
+
     /// Optional absolute state root. Linux only; immutable until engine restart.
     /// No default or implicit environment lookup. Legacy checkpoints are not migrated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,6 +190,22 @@ pub struct EngineConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[schemars(extend("x-kubernetes-preserve-unknown-fields" = true))]
     pub custom: HashMap<String, Value>,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            shutdown_drain_timeout_seconds: default_shutdown_drain_timeout_seconds(),
+            state_dir: None,
+            http_admin: None,
+            telemetry: TelemetryConfig::default(),
+            observed_state: ObservedStateSettings::default(),
+            topics: EngineTopicsConfig::default(),
+            controller: EngineControllerConfig::default(),
+            observability: EngineObservabilityConfig::default(),
+            custom: HashMap::new(),
+        }
+    }
 }
 
 impl EngineConfig {
@@ -1462,6 +1486,24 @@ groups:
         let yaml = valid_engine_yaml(ENGINE_CONFIG_VERSION_V1);
         let config = OtelDataflowSpec::from_yaml(&yaml).expect("should parse");
         assert!(config.engine.custom.is_empty());
+    }
+
+    #[test]
+    fn shutdown_drain_timeout_parses_positive_seconds_only() {
+        let default: EngineConfig = serde_json::from_str("{}").expect("default engine config");
+        assert_eq!(default.shutdown_drain_timeout_seconds.get(), 60);
+        assert_eq!(EngineConfig::default(), default);
+        let configured: EngineConfig =
+            serde_json::from_str(r#"{"shutdown_drain_timeout_seconds":240}"#)
+                .expect("positive integer");
+        assert_eq!(configured.shutdown_drain_timeout_seconds.get(), 240);
+        for invalid in ["0", "-1", "1.5", r#""240""#, "null", "4294967296"] {
+            let input = format!(r#"{{"shutdown_drain_timeout_seconds":{invalid}}}"#);
+            assert!(
+                serde_json::from_str::<EngineConfig>(&input).is_err(),
+                "{input}"
+            );
+        }
     }
 
     #[test]
