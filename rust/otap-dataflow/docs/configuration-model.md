@@ -363,10 +363,13 @@ for permission, durability, platform, and consumer-adoption requirements.
 
 ### OS Signal Drain Timeout
 
-`engine.shutdown_drain_timeout_seconds` is a positive integer in seconds
-(default `60`). It bounds pipeline drain after the first OS termination signal.
-Changes require an engine restart. Set the process supervisor's stop grace
-longer than this deadline so it does not kill the process during drain.
+`engine.shutdown_drain_timeout_seconds` accepts whole seconds from `1` to `1500`
+(default `60`). It bounds each pipeline drain phase after the first OS
+termination signal. The 25-minute cap per phase allows producer and system
+observability drain to fit within an hour-long supervisor stop grace, with
+time left for finalization. Set the supervisor's grace to cover both phases
+if system observability is enabled, plus time for teardown. Changes require
+an engine restart.
 
 ### Engine Topic Settings
 

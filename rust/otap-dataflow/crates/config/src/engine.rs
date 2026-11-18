@@ -142,8 +142,26 @@ struct ContextPolicyLayer<'a> {
     context: Option<&'a ContextPolicy>,
 }
 
+/// Longest OS-signal drain budget (25 minutes per pipeline shutdown phase).
+pub const MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS: u32 = 1_500;
+
 const fn default_shutdown_drain_timeout_seconds() -> std::num::NonZeroU32 {
     std::num::NonZeroU32::new(60).expect("60 is nonzero")
+}
+
+fn deserialize_shutdown_drain_timeout_seconds<'de, D>(
+    deserializer: D,
+) -> Result<std::num::NonZeroU32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let seconds = std::num::NonZeroU32::deserialize(deserializer)?;
+    if seconds.get() > MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS {
+        return Err(serde::de::Error::custom(format_args!(
+            "shutdown_drain_timeout_seconds must be in 1..={MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS}"
+        )));
+    }
+    Ok(seconds)
 }
 
 /// Top-level engine configuration section.
@@ -151,7 +169,11 @@ const fn default_shutdown_drain_timeout_seconds() -> std::num::NonZeroU32 {
 #[serde(deny_unknown_fields)]
 pub struct EngineConfig {
     /// Graceful pipeline drain budget after the first OS termination signal, in seconds.
-    #[serde(default = "default_shutdown_drain_timeout_seconds")]
+    #[serde(
+        default = "default_shutdown_drain_timeout_seconds",
+        deserialize_with = "deserialize_shutdown_drain_timeout_seconds"
+    )]
+    #[schemars(range(min = 1, max = MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS))]
     pub shutdown_drain_timeout_seconds: std::num::NonZeroU32,
 
     /// Optional absolute state root. Linux only; immutable until engine restart.
@@ -1497,13 +1519,40 @@ groups:
             serde_json::from_str(r#"{"shutdown_drain_timeout_seconds":240}"#)
                 .expect("positive integer");
         assert_eq!(configured.shutdown_drain_timeout_seconds.get(), 240);
-        for invalid in ["0", "-1", "1.5", r#""240""#, "null", "4294967296"] {
+        let max: EngineConfig = serde_json::from_value(serde_json::json!({
+            "shutdown_drain_timeout_seconds": MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+        }))
+        .expect("maximum permitted drain budget");
+        assert_eq!(
+            max.shutdown_drain_timeout_seconds.get(),
+            MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+        );
+        let above_max = (MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS + 1).to_string();
+        for invalid in [
+            "0",
+            "-1",
+            "1.5",
+            r#""240""#,
+            "null",
+            &above_max,
+            "4294967295",
+            "4294967296",
+        ] {
             let input = format!(r#"{{"shutdown_drain_timeout_seconds":{invalid}}}"#);
             assert!(
                 serde_json::from_str::<EngineConfig>(&input).is_err(),
                 "{input}"
             );
         }
+        let schema = serde_json::to_value(schemars::schema_for!(EngineConfig)).expect("schema");
+        let field = &schema["properties"]["shutdown_drain_timeout_seconds"];
+        assert_eq!(field["type"], "integer");
+        assert_eq!(field["default"], 60);
+        assert_eq!(field["minimum"].as_f64(), Some(1.0));
+        assert_eq!(
+            field["maximum"].as_f64(),
+            Some(f64::from(MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS)),
+        );
     }
 
     #[test]
