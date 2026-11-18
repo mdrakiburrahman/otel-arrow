@@ -185,6 +185,20 @@ fn validate_engine_config_for_startup(
     Ok(())
 }
 
+fn validate_and_observe_engine_config(
+    engine_cfg: &OtelDataflowSpec,
+    run_options: &ControllerRunOptions,
+    observe: Option<impl FnOnce(&OtelDataflowSpec) -> Result<(), Box<dyn std::error::Error>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_engine_config_for_startup(engine_cfg, run_options)?;
+    if let Some(observe) = observe {
+        // The CLI can override policies after the config was parsed.
+        engine_cfg.validate()?;
+        observe(engine_cfg)?;
+    }
+    Ok(())
+}
+
 /// Installs the selected crypto provider before embedding startup performs TLS I/O.
 ///
 /// Subsequent engine startup reuses the same initialization result.
@@ -240,6 +254,32 @@ pub fn run_with_shutdown<F: FnOnce()>(shutdown: F) -> Result<(), Box<dyn std::er
 pub fn run_with_shutdown_status<F: FnOnce(bool)>(
     shutdown: F,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_internal(
+        None::<fn(&OtelDataflowSpec) -> Result<(), Box<dyn std::error::Error>>>,
+        shutdown,
+    )
+}
+
+/// Runs the engine with a read-only observer of the accepted startup configuration.
+///
+/// The observer runs once after configuration validation and CLI overrides, before
+/// the controller starts. Validation-only and license exits skip the observer.
+/// The shutdown callback has the same semantics as [`run_with_shutdown_status`].
+///
+/// # Errors
+/// Returns configuration, crypto-provider, observer, and controller startup failures.
+/// An observer error prevents startup; an observer panic is not caught.
+pub fn run_with_config_observer_and_shutdown_status(
+    observe: impl FnOnce(&OtelDataflowSpec) -> Result<(), Box<dyn std::error::Error>>,
+    shutdown: impl FnOnce(bool),
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_internal(Some(observe), shutdown)
+}
+
+fn run_internal(
+    observe: Option<impl FnOnce(&OtelDataflowSpec) -> Result<(), Box<dyn std::error::Error>>>,
+    shutdown: impl FnOnce(bool),
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut shutdown = ShutdownGuard {
         callback: Some(shutdown),
         clean: false,
@@ -293,7 +333,11 @@ pub fn run_with_shutdown_status<F: FnOnce(bool)>(
         handle_os_signals: true,
         ..Default::default()
     };
-    validate_engine_config_for_startup(&engine_cfg, &run_options)?;
+    validate_and_observe_engine_config(
+        &engine_cfg,
+        &run_options,
+        if validate_and_exit { None } else { observe },
+    )?;
 
     if validate_and_exit {
         println!("Configuration '{}' is valid.", resolved.source);
@@ -435,6 +479,69 @@ mod tests {
         ]);
         assert!(args.validate_and_exit);
         assert_eq!(args.config.as_deref(), Some("config.yaml"));
+    }
+
+    #[test]
+    fn startup_observer_receives_the_accepted_spec_and_can_prevent_startup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = OtelDataflowSpec::from_yaml(
+            "version: otel_dataflow/v1\nengine:\n  shutdown_drain_timeout_seconds: 240\ngroups: {}\n",
+        )?;
+        startup::apply_cli_overrides(&mut spec, Some(2), None, None);
+        let options = ControllerRunOptions::default();
+        let calls = std::cell::Cell::new(0);
+        let result = validate_and_observe_engine_config(
+            &spec,
+            &options,
+            Some(|accepted: &OtelDataflowSpec| {
+                assert!(std::ptr::eq(accepted, &spec));
+                assert_eq!(accepted.engine.shutdown_drain_timeout_seconds.get(), 240);
+                calls.set(calls.get() + 1);
+                Err(std::io::Error::other("observer refused startup").into())
+            }),
+        );
+        assert_eq!(
+            result
+                .expect_err("an observer error must prevent startup")
+                .to_string(),
+            "observer refused startup"
+        );
+        assert_eq!(calls.get(), 1);
+        validate_and_observe_engine_config(&spec, &options, Some(|_: &OtelDataflowSpec| Ok(())))?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_observer_does_not_receive_a_spec_rejected_by_startup_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let spec = OtelDataflowSpec::from_yaml(&format!(
+            r#"
+version: otel_dataflow/v1
+engine:
+  controller:
+    extensions:
+      controller_monitor:
+        type: "{}"
+        config:
+          interval: "0s"
+groups: {{}}
+"#,
+            otel_arrow_dfe_controller::CONTROLLER_MONITOR_EXTENSION_URN
+        ))?;
+        let result = validate_and_observe_engine_config(
+            &spec,
+            &ControllerRunOptions::default(),
+            Some(|_: &OtelDataflowSpec| {
+                panic!("observer ran on a spec rejected by startup validation")
+            }),
+        );
+        assert!(
+            result
+                .expect_err("invalid extension must prevent startup")
+                .to_string()
+                .contains("Invalid config for controller extension")
+        );
+        Ok(())
     }
 
     #[test]
