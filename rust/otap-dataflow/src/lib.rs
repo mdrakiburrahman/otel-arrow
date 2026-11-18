@@ -302,6 +302,11 @@ pub fn run_with_shutdown_status<F: FnOnce(bool)>(
         std::process::exit(0);
     }
 
+    eprintln!(
+        "df_engine_effective_config {{\"engine\":{{\"shutdown_drain_timeout_seconds\":{}}}}}",
+        engine_cfg.engine.shutdown_drain_timeout_seconds,
+    );
+
     // Applied to the accepted configuration before any pipeline starts, so a
     // `pretty` console exporter never reaches a stdout that carries records.
     claim_structured_stdout(&engine_cfg);
