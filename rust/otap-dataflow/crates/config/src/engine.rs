@@ -1556,6 +1556,25 @@ groups:
     }
 
     #[test]
+    fn typed_engine_config_cannot_bypass_the_drain_timeout_cap() {
+        let mut config = OtelDataflowSpec::from_yaml(&valid_engine_yaml(ENGINE_CONFIG_VERSION_V1))
+            .expect("valid engine configuration");
+        config.engine.shutdown_drain_timeout_seconds =
+            std::num::NonZeroU32::new(MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS).unwrap();
+        config.validate().expect("maximum permitted drain budget");
+        for invalid in [MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS + 1, u32::MAX] {
+            config.engine.shutdown_drain_timeout_seconds =
+                std::num::NonZeroU32::new(invalid).unwrap();
+            let err = config.validate().expect_err("oversized typed drain budget");
+            assert!(
+                err.to_string()
+                    .contains("engine.shutdown_drain_timeout_seconds"),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn controller_extensions_default_to_empty() {
         let yaml = valid_engine_yaml(ENGINE_CONFIG_VERSION_V1);
         let config = OtelDataflowSpec::from_yaml(&yaml).expect("should parse");

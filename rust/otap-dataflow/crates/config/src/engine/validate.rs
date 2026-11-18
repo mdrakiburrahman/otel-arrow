@@ -5,7 +5,8 @@
 
 use crate::engine::{
     ContextPolicyLayer, ENGINE_CONFIG_VERSION_V1, INTERNAL_TELEMETRY_RECEIVER_URN,
-    OtelDataflowSpec, SYSTEM_OBSERVABILITY_PIPELINE_ID, SYSTEM_PIPELINE_GROUP_ID,
+    MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS, OtelDataflowSpec, SYSTEM_OBSERVABILITY_PIPELINE_ID,
+    SYSTEM_PIPELINE_GROUP_ID,
 };
 use crate::error::Error;
 
@@ -47,6 +48,13 @@ impl OtelDataflowSpec {
     pub fn validate(&self) -> Result<(), Error> {
         let mut errors = Vec::new();
 
+        if self.engine.shutdown_drain_timeout_seconds.get() > MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS {
+            errors.push(Error::InvalidUserConfig {
+                error: format!(
+                    "engine.shutdown_drain_timeout_seconds must be in 1..={MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS}"
+                ),
+            });
+        }
         if let Some(path) = &self.engine.state_dir
             && let Err(reason) = crate::engine::state_dir::validate_state_dir(path)
         {
